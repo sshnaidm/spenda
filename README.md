@@ -18,7 +18,18 @@ The dashboard reads local history and stores its own reporting database. It does
 
 Requires Python 3.11 or newer and at least one supported coding agent with local history.
 
-### With uv
+### With uvx
+
+With this method you don't need to clone this repository, simply run both commands below.
+
+```bash
+uvx git+https://github.com/sshnaidm/spenda ingest --all
+uvx git+https://github.com/sshnaidm/spenda serve
+```
+
+### With uv 
+
+This requires cloning the repository first
 
 ```bash
 uv sync
