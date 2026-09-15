@@ -37,6 +37,28 @@ spenda ingest --all
 spenda serve
 ```
 
+### Without cloning
+
+You can also install Spenda directly from GitHub, without cloning the repo first.
+
+```bash
+pip install git+https://github.com/sshnaidm/spenda.git
+```
+
+Or with [pipx](https://pypa.github.io/pipx/) (recommended, isolates the CLI in its own venv):
+
+```bash
+pipx install git+https://github.com/sshnaidm/spenda.git
+```
+
+Or with uv:
+
+```bash
+uv tool install git+https://github.com/sshnaidm/spenda.git
+```
+
+Then run `spenda ingest --all` and `spenda serve` as above.
+
 Open <http://127.0.0.1:8765>.
 
 ## Use
