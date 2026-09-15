@@ -59,6 +59,13 @@ uv tool install git+https://github.com/sshnaidm/spenda.git
 
 Then run `spenda ingest --all` and `spenda serve` as above.
 
+You can also run it directly with `uvx`, without installing anything:
+
+```bash
+uvx git+https://github.com/sshnaidm/spenda ingest --all
+uvx git+https://github.com/sshnaidm/spenda serve
+```
+
 Open <http://127.0.0.1:8765>.
 
 ## Use
