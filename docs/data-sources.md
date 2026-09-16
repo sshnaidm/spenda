@@ -70,7 +70,8 @@ only assistant content-block types and tool names to produce a fixed action
 label; content bodies and tool arguments are discarded.
 
 Assistant usage is keyed by `(sessionId, message.id)`. Streaming updates for
-the same message keep the latest record. Uncached input, cache-read input,
+the same message keep the latest record, including when Claude copies shared
+history into several subagent transcript files. Uncached input, cache-read input,
 cache-creation input, output, and thinking-token subsets map directly into the
 normalized token fields; the `cache_creation.ephemeral_1h_input_tokens` subset
 is kept as `cache_write_1h_input_tokens`. Claude's output already includes
@@ -82,6 +83,16 @@ without inventing per-message dollar allocations. Claude Code's cumulative
 total covers the whole session including subagent calls (models that only
 appear in subagent transcripts are listed in the root's cost-state), so every
 call of a session with a complete cost-state is represented by that record.
+When `modelUsage` includes cumulative token counters, those counters are also
+authoritative for reports; transcript call rows remain auditable but do not add
+their copied or incomplete token totals again.
+
+The Claude session's turn count is the number of root records whose structured
+`origin.kind` is `human` (with a conservative fallback for older typed prompt
+envelopes). Tool results and generated task notifications are not user turns.
+Prompt bodies are never retained. A source session may contain several human
+prompts while keeping its original generated title, so the UI labels such rows
+with their prompt count.
 
 ### API backend and billing
 
@@ -95,9 +106,10 @@ session records a `backend` so these can be filtered and totaled separately:
 | `vertex` | `message.id` starts with `msg_vrtx_` or the envelope `requestId` starts with `req_vrtx_` |
 | `bedrock` | `message.id` starts with `msg_bdrk_` |
 | `anthropic-oauth` | `msg_` id and the home's login profile is a claude.ai subscription |
-| `anthropic-api` | `msg_` id and an API key is configured (or was previously approved) |
+| `anthropic-api` | `msg_` id and an API key or API-key helper is actively configured |
 | `anthropic` | `msg_` id and the login profile is unknown |
 | `mixed` | a session or transcript whose calls used several backends |
+| `unknown` | no supported backend evidence is available |
 
 Transcripts do not say whether a direct call was paid by subscription or API
 key, so the adapter reads a small allow-list of non-secret scalar fields from
@@ -110,8 +122,11 @@ home), and from `settings.json` the presence of `apiKeyHelper` or of the
 `CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_VERTEX_PROJECT_ID`, and `CLOUD_ML_REGION`
 variables in its `env` block or in the process environment. Only the names
 of key variables are inspected, never their values. `.credentials.json` holds
-tokens and is never opened. A login profile outranks an API-key hint; `spenda
-doctor` reports both and warns when they coexist.
+tokens and is never opened. An active API key or key helper outranks the
+subscription OAuth profile, matching Claude Code's credential precedence;
+historical key approval alone is diagnostic and does not prove that a key is
+currently active. `spenda doctor` reports the evidence and warns when active
+API-key and OAuth evidence coexist.
 
 Because project directories are sometimes copied between machines, one home
 can hold sessions from several backends. Per-message detection is therefore
@@ -124,6 +139,13 @@ Subscription usage has no metered charge. Its rows carry
 `billing_mode='subscription'`, a real `cost_usd` of `0`, and the list-price
 value of the calls in `equivalent_cost_usd`. Reports show real spend by
 default and offer an "Include subscription value" toggle.
+
+Claude cost-state totals are whole-session source evidence. If a cost-state
+covers more than one backend, the session is classified as `mixed`; its total
+is not prorated and component backend filters exclude it. Without cost-state,
+only direct Anthropic API or subscription calls are estimated from first-party
+prices. Bedrock, Vertex, and unclassified direct calls stay unpriced because
+the transcript does not establish a safe provider/region/service-tier price.
 
 Claude scans import valid records from a readable transcript even when another
 line or transcript has an error. Destructive reconciliation is limited to

@@ -71,7 +71,7 @@ def test_api_key_profile_from_settings_and_environment(tmp_path):
 
     history_only = read_auth_profile(home, environ={})
     assert (history_only.oauth, history_only.anthropic_backend, history_only.login) == (
-        False, "anthropic-api", "api-key (previously approved)",
+        False, "anthropic", "api-key (previously approved)",
     )
 
     (home / "settings.json").write_text(json.dumps({"env": {"ANTHROPIC_API_KEY": "sk-secret"}}), encoding="utf-8")
@@ -105,7 +105,7 @@ def test_login_and_live_key_are_ambiguous_and_override_resolves(tmp_path):
     )
 
     profile = read_auth_profile(home, environ={})
-    assert profile.ambiguous and profile.anthropic_backend == "anthropic-oauth"
+    assert profile.ambiguous and profile.anthropic_backend == "anthropic-api"
 
     forced_api = read_auth_profile(home, environ={}, override="api")
     forced_subscription = read_auth_profile(_home(tmp_path / "bare"), environ={}, override="subscription")
@@ -185,10 +185,14 @@ def test_schema_v5_database_gains_backend_columns(tmp_path):
         sessions = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
         agents = {row[1] for row in conn.execute("PRAGMA table_info(agents)")}
         row = conn.execute(
-            "SELECT backend,billing_mode,cache_write_1h_input_tokens,equivalent_cost_usd,cost_usd FROM usage"
+            "SELECT backend,billing_mode,cache_write_1h_input_tokens,equivalent_cost_usd,"
+            "cost_usd,counts_toward_totals FROM usage"
         ).fetchone()
         version = conn.execute("SELECT value FROM dashboard_meta WHERE key='schema_version'").fetchone()[0]
-    assert {"backend", "billing_mode", "cache_write_1h_input_tokens", "equivalent_cost_usd"} <= usage
+    assert {
+        "backend", "billing_mode", "cache_write_1h_input_tokens", "equivalent_cost_usd",
+        "counts_toward_totals",
+    } <= usage
     assert "root_backend" in sessions and "backend" in agents
-    assert row == (None, "metered", 0, None, "0")
-    assert version == "6"
+    assert row == (None, "metered", 0, None, "0", 1)
+    assert version == "7"

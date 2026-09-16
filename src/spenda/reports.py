@@ -23,8 +23,30 @@ def cost_sql(include_subscription: bool, alias: str = "u") -> tuple[str, str]:
     )
 
 
-def session_aggregate_sql(include_subscription: bool = False) -> str:
+def token_sum_sql(column: str, alias: str = "u") -> str:
+    """Sum only ledger rows selected as the authoritative token source."""
+
+    prefix = f"{alias}." if alias else ""
+    return f"SUM(CASE WHEN {prefix}counts_toward_totals!=0 THEN {prefix}{column} ELSE 0 END)"
+
+
+def session_aggregate_sql(
+    include_subscription: bool = False, *, backend: str = "all", since: str | None = None
+) -> str:
     cost, unknown = cost_sql(include_subscription, alias="")
+    input_tokens = token_sum_sql("input_tokens", alias="")
+    cached_tokens = token_sum_sql("cached_input_tokens", alias="")
+    cache_write_tokens = token_sum_sql("cache_write_input_tokens", alias="")
+    uncached_tokens = token_sum_sql("uncached_input_tokens", alias="")
+    output_tokens = token_sum_sql("output_tokens", alias="")
+    reasoning_tokens = token_sum_sql("reasoning_output_tokens", alias="")
+    total_tokens = token_sum_sql("total_tokens", alias="")
+    usage_clauses = []
+    if backend != "all":
+        usage_clauses.append("backend=?")
+    if since is not None:
+        usage_clauses.append("julianday(timestamp)>=julianday(?)")
+    usage_where = " WHERE " + " AND ".join(usage_clauses) if usage_clauses else ""
     # ``estimated`` sessions are priced from list prices rather than a
     # source-reported total; they count as known cost, unlike ``partial``.
     return f"""
@@ -33,16 +55,16 @@ WITH agent_agg AS (
 ), usage_agg AS (
   SELECT session_id,GROUP_CONCAT(DISTINCT model) models_used,
          GROUP_CONCAT(DISTINCT backend) backends_used,
-         SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
-         SUM(cache_write_input_tokens) cache_write_input_tokens,
-         SUM(uncached_input_tokens) uncached_input_tokens,SUM(output_tokens) output_tokens,
-         SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
+         {input_tokens} input_tokens,{cached_tokens} cached_input_tokens,
+         {cache_write_tokens} cache_write_input_tokens,
+         {uncached_tokens} uncached_input_tokens,{output_tokens} output_tokens,
+         {reasoning_tokens} reasoning_tokens,{total_tokens} total_tokens,
          SUM({cost}) known_cost_usd,
          SUM(CAST(equivalent_cost_usd AS REAL)) equivalent_cost_usd,
          SUM(CASE WHEN {unknown} THEN 1 ELSE 0 END) unknown_cost_records,
          SUM(billing_mode='subscription' AND equivalent_cost_usd IS NULL) unknown_value_records,
          SUM(source_event_type!='claude_cost_state') usage_events
-  FROM usage GROUP BY session_id
+  FROM usage{usage_where} GROUP BY session_id
 ), tag_agg AS (
   SELECT st.session_id,GROUP_CONCAT(t.name) tags
   FROM session_tags st JOIN tags t ON t.id=st.tag_id GROUP BY st.session_id
@@ -85,6 +107,8 @@ def session_rows(
     direction: str = "desc",
     limit: int | None = None,
     include_subscription: bool = False,
+    backend: str = "all",
+    since: str | None = None,
 ) -> list[sqlite3.Row]:
     allowed_orders = {
         "time": "julianday(s.created_at)",
@@ -106,9 +130,15 @@ def session_rows(
     expression = allowed_orders.get(order, allowed_orders["started"])
     order_direction = "ASC" if direction.lower() == "asc" else "DESC"
     sql = (
-        session_aggregate_sql(include_subscription)
+        session_aggregate_sql(include_subscription, backend=backend, since=since)
         + f" WHERE {where} ORDER BY {expression} {order_direction}, s.created_at DESC, s.id"
     )
+    aggregate_params: tuple[Any, ...] = ()
+    if backend != "all":
+        aggregate_params = (*aggregate_params, backend)
+    if since is not None:
+        aggregate_params = (*aggregate_params, since)
+    params = (*aggregate_params, *params)
     if limit is not None:
         sql += " LIMIT ?"
         params = (*params, limit)
@@ -116,10 +146,27 @@ def session_rows(
 
 
 def session_detail(
-    conn: sqlite3.Connection, session_id: str, *, include_subscription: bool = False
+    conn: sqlite3.Connection, session_id: str, *, include_subscription: bool = False,
+    backend: str = "all",
 ) -> sqlite3.Row | None:
+    where = "s.id=?"
+    params: tuple[Any, ...] = (session_id,)
+    if backend != "all":
+        where += (
+            " AND EXISTS(SELECT 1 FROM usage detail_backend "
+            "WHERE detail_backend.session_id=s.id AND detail_backend.backend=?)"
+        )
+        params = (*params, backend)
+        if backend != "mixed":
+            where += (
+                " AND NOT EXISTS(SELECT 1 FROM usage detail_mixed "
+                "WHERE detail_mixed.session_id=s.id "
+                "AND detail_mixed.source_event_type='claude_cost_state' "
+                "AND detail_mixed.backend='mixed')"
+            )
     rows = session_rows(
-        conn, where="s.id=?", params=(session_id,), include_subscription=include_subscription
+        conn, where=where, params=params, include_subscription=include_subscription,
+        backend=backend,
     )
     return rows[0] if rows else None
 
@@ -134,6 +181,8 @@ def format_tokens(value: int | None) -> str:
 
 
 def format_cost(value: float | str | None, unknown: int = 0) -> str:
+    """Format the known numeric amount without uncertainty symbols."""
+
     amount = float(value or 0)
     digits = 4 if abs(amount) < 10 else 2
     return f"${amount:,.{digits}f}"

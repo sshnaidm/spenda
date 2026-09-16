@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS usage (
     output_tokens INTEGER NOT NULL,
     reasoning_output_tokens INTEGER NOT NULL,
     total_tokens INTEGER NOT NULL,
+    counts_toward_totals INTEGER NOT NULL DEFAULT 1,
     source_file TEXT NOT NULL,
     source_ordinal INTEGER,
     source_event_type TEXT NOT NULL,
@@ -209,7 +210,7 @@ def _migrate_session_source_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_backend_columns(conn: sqlite3.Connection) -> None:
-    """Add the v6 API-backend and billing columns to an existing database."""
+    """Add post-v5 API-backend, billing, and authoritative-ledger columns."""
     additions = {
         "sessions": (("root_backend", "TEXT"),),
         "agents": (("backend", "TEXT"),),
@@ -218,6 +219,7 @@ def _migrate_backend_columns(conn: sqlite3.Connection) -> None:
             ("billing_mode", "TEXT NOT NULL DEFAULT 'metered'"),
             ("cache_write_1h_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("equivalent_cost_usd", "TEXT"),
+            ("counts_toward_totals", "INTEGER NOT NULL DEFAULT 1"),
         ),
     }
     for table, columns in additions.items():

@@ -16,10 +16,19 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import Settings
 from ..db import database, initialize
-from ..ingestion.claude_auth import BACKEND_LABELS, BACKENDS
+from ..ingestion.claude_auth import BACKEND_LABELS, BACKEND_MIXED, BACKENDS
 from ..ingestion.service import ingest_all as ingest
 from ..pricing import seed_prices
-from ..reports import cost_sql, format_cost, format_duration, format_tokens, iso_date, session_detail, session_rows
+from ..reports import (
+    cost_sql,
+    format_cost,
+    format_duration,
+    format_tokens,
+    iso_date,
+    session_detail,
+    session_rows,
+    token_sum_sql,
+)
 
 log = logging.getLogger(__name__)
 TEMPLATE_DIR = Path(__file__).with_name("templates")
@@ -94,14 +103,30 @@ def _source_usage_clause(source: str, backend: str = "all", alias: str = "u") ->
     if backend != "all":
         clauses.append(f"{alias}.backend=?")
         params.append(backend)
+        if backend != BACKEND_MIXED:
+            clauses.append(
+                f"NOT EXISTS(SELECT 1 FROM usage mixed_state "
+                f"WHERE mixed_state.session_id={alias}.session_id "
+                "AND mixed_state.source_event_type='claude_cost_state' "
+                "AND mixed_state.backend='mixed')"
+            )
     return " AND ".join(clauses) or "1=1", tuple(params)
 
 
 def _backend_session_clause(backend: str, alias: str = "s") -> tuple[str, tuple[Any, ...]]:
-    """Match sessions with at least one call on the backend (mixed units match each)."""
+    """Match sessions whose accounting can be attributed to the backend."""
     if backend == "all":
         return "1=1", ()
-    return f"EXISTS(SELECT 1 FROM usage ub WHERE ub.session_id={alias}.id AND ub.backend=?)", (backend,)
+    match = f"EXISTS(SELECT 1 FROM usage ub WHERE ub.session_id={alias}.id AND ub.backend=?)"
+    if backend == BACKEND_MIXED:
+        return match, (backend,)
+    # A cumulative mixed-backend cost-state cannot be split honestly. Keep it
+    # in All/Mixed instead of making every component backend appear as $0.
+    strict = (
+        f" NOT EXISTS(SELECT 1 FROM usage um WHERE um.session_id={alias}.id "
+        "AND um.source_event_type='claude_cost_state' AND um.backend='mixed')"
+    )
+    return f"{match} AND{strict}", (backend,)
 
 
 def _query_suffix(source: str, backend: str, include_subscription: bool) -> str:
@@ -112,6 +137,16 @@ def _query_suffix(source: str, backend: str, include_subscription: bool) -> str:
     if include_subscription:
         items.append(("include_subscription", "1"))
     return urlencode(items)
+
+
+def _strict_unknown_cost(unknown: str, usage_alias: str = "u") -> str:
+    """Include source-level accounting gaps in an aggregate's unknown flag."""
+
+    return (
+        f"(({unknown}) OR EXISTS(SELECT 1 FROM sessions accounting_session "
+        f"WHERE accounting_session.id={usage_alias}.session_id "
+        "AND accounting_session.accounting_status NOT IN ('complete','estimated')))"
+    )
 
 
 def _model_composition(rows: list[Any]) -> dict[str, Any]:
@@ -183,19 +218,25 @@ def _period_clause(period: str, source: str = "all", backend: str = "all") -> tu
 
 def _session_period(period: str, source: str = "all", backend: str = "all") -> tuple[str, tuple[Any, ...]]:
     boundary = _period_boundary(period)
+    # Period and backend apply to the same usage row, so a session whose only
+    # recent activity is on another backend does not match.
     usage = "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id"
     params: list[Any] = []
     if boundary is not None:
         usage += " AND julianday(up.timestamp)>=julianday(?)"
         params.append(boundary)
+    if backend != "all":
+        usage += " AND up.backend=?"
+        params.append(backend)
+        if backend != BACKEND_MIXED:
+            usage += (
+                " AND NOT EXISTS(SELECT 1 FROM usage um WHERE um.session_id=s.id "
+                "AND um.source_event_type='claude_cost_state' AND um.backend='mixed')"
+            )
     usage += ")"
     if source != "all":
         usage += " AND s.source_app=?"
         params.append(source)
-    backend_clause, backend_params = _backend_session_clause(backend)
-    if backend_params:
-        usage += f" AND {backend_clause}"
-        params.extend(backend_params)
     return usage, tuple(params)
 
 
@@ -205,9 +246,13 @@ def _overview(
 ) -> dict[str, Any]:
     usage_where, usage_params = _period_clause(period, source, backend)
     cost, unknown = cost_sql(include_subscription)
+    strict_unknown = _strict_unknown_cost(unknown)
+    total_tokens = token_sum_sql("total_tokens")
+    input_tokens = token_sum_sql("input_tokens")
+    cached_tokens = token_sum_sql("cached_input_tokens")
     usage = conn.execute(
-        f"""SELECT COALESCE(SUM(total_tokens),0) tokens,COALESCE(SUM(input_tokens),0) input_tokens,
-            COALESCE(SUM(cached_input_tokens),0) cached_tokens,SUM({cost}) known_cost,
+        f"""SELECT COALESCE({total_tokens},0) tokens,COALESCE({input_tokens},0) input_tokens,
+            COALESCE({cached_tokens},0) cached_tokens,SUM({cost}) known_cost,
             SUM({unknown}) unknown_cost_records,COUNT(DISTINCT session_id) sessions,
             COUNT(DISTINCT thread_id) agents,
             SUM(CAST(u.equivalent_cost_usd AS REAL)) subscription_value,
@@ -218,26 +263,32 @@ def _overview(
     session_where, session_params = _session_period(period, source, backend)
     rows = session_rows(
         conn, where=session_where, params=session_params, order=sort, direction=direction,
-        include_subscription=include_subscription,
+        include_subscription=include_subscription, backend=backend,
+        since=_period_boundary(period),
     )
     incomplete_sessions = sum(
         1 for row in rows if row["accounting_status"] not in ("complete", "estimated")
     )
+    aggregate_unknown = int(usage["unknown_cost_records"] or 0) + incomplete_sessions
     known_session_costs = [
         float(r[0] or 0) for r in conn.execute(
-            f"""SELECT SUM({cost}) FROM usage u WHERE {usage_where}
-                GROUP BY session_id HAVING SUM({unknown})=0""",
+            f"""SELECT SUM({cost}) FROM usage u
+                JOIN sessions average_session ON average_session.id=u.session_id
+                WHERE {usage_where} GROUP BY session_id
+                HAVING SUM({unknown})=0
+                AND MAX(average_session.accounting_status IN ('complete','estimated'))=1""",
             usage_params,
         ).fetchall()
     ]
     subagents = sum(max(0, int(r["agent_count"]) - 1) for r in rows)
+    output_tokens = token_sum_sql("output_tokens")
     models = conn.execute(
         f"""SELECT model,GROUP_CONCAT(DISTINCT backend) backends,
             COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
-            SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
-            SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,
+            {input_tokens} input_tokens,{cached_tokens} cached_input_tokens,
+            {output_tokens} output_tokens,{total_tokens} total_tokens,
             SUM(source_event_type!='claude_cost_state') usage_events,
-            SUM({cost}) cost_usd,SUM({unknown}) unknown_cost_records
+            SUM({cost}) cost_usd,SUM({strict_unknown}) unknown_cost_records
             FROM usage u WHERE {usage_where} GROUP BY model ORDER BY cost_usd DESC""",
         usage_params,
     ).fetchall()
@@ -247,12 +298,12 @@ def _overview(
     return {
         "tokens": usage["tokens"], "input_tokens": usage["input_tokens"],
         "cached_tokens": usage["cached_tokens"], "known_cost": total_known,
-        "unknown_cost_records": (usage["unknown_cost_records"] or 0) + incomplete_sessions,
+        "unknown_cost_records": aggregate_unknown,
         "subscription_value": float(usage["subscription_value"] or 0),
         "unknown_value_records": int(usage["unknown_value_records"] or 0),
         "sessions": len(rows), "agents": usage["agents"], "subagents": subagents,
-        "average": statistics.fmean(known_session_costs) if known_session_costs else 0,
-        "median": statistics.median(known_session_costs) if known_session_costs else 0,
+        "average": statistics.fmean(known_session_costs) if known_session_costs and not aggregate_unknown else None,
+        "median": statistics.median(known_session_costs) if known_session_costs and not aggregate_unknown else None,
         "cached_pct": 100 * usage["cached_tokens"] / usage["input_tokens"] if usage["input_tokens"] else 0,
         "most_used": most_used, "most_expensive": most_expensive,
         "models": models, "model_composition": _model_composition(models),
@@ -407,24 +458,42 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             clauses.append("COALESCE(s.repo_name,s.cwd)=?")
             params.append(project)
         if model:
-            clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model=?)")
+            model_backend = "" if backend == "all" else " AND uf.backend=?"
+            clauses.append(
+                f"EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id "
+                f"AND uf.model=?{model_backend})"
+            )
             params.append(model)
+            if backend != "all":
+                params.append(backend)
         if root_model:
             clauses.append("s.root_model=?")
             params.append(root_model)
         if contains_astra:
-            clauses.append("EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id AND uf.model='gpt-6-astra')")
+            astra_backend = "" if backend == "all" else " AND uf.backend=?"
+            clauses.append(
+                "EXISTS(SELECT 1 FROM usage uf WHERE uf.session_id=s.id "
+                f"AND uf.model='gpt-6-astra'{astra_backend})"
+            )
+            if backend != "all":
+                params.append(backend)
         if subagents:
             clauses.append(
                 "EXISTS(SELECT 1 FROM agents af WHERE af.session_id=s.id AND af.parent_thread_id IS NOT NULL)"
             )
         if min_cost is not None:
-            clauses.append(f"COALESCE((SELECT SUM({cost}) FROM usage uf WHERE uf.session_id=s.id),0)>=?")
+            backend_cost = "" if backend == "all" else " AND uf.backend=?"
+            clauses.append(
+                f"COALESCE((SELECT SUM({cost}) FROM usage uf "
+                f"WHERE uf.session_id=s.id{backend_cost}),0)>=?"
+            )
+            if backend != "all":
+                params.append(backend)
             params.append(min_cost)
         with database(settings.database, readonly=True) as conn:
             rows = session_rows(
                 conn, where=" AND ".join(clauses), params=tuple(params), order=sort,
-                direction=direction, include_subscription=include_subscription,
+                direction=direction, include_subscription=include_subscription, backend=backend,
             )
             source_sql, source_values = (("", ()) if source == "all" else (" AND source_app=?", (source,)))
             projects = [r[0] for r in conn.execute(
@@ -450,38 +519,71 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
     def session_page(
         request: Request, session_id: str, backend: str = "all", include_subscription: bool = False,
     ):
+        backend = _backend(backend)
         cost, unknown = cost_sql(include_subscription)
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
+        output_tokens = token_sum_sql("output_tokens")
+        reasoning_tokens = token_sum_sql("reasoning_output_tokens")
+        total_tokens = token_sum_sql("total_tokens")
         with database(settings.database, readonly=True) as conn:
-            session = session_detail(conn, session_id, include_subscription=include_subscription)
+            session = session_detail(
+                conn, session_id, include_subscription=include_subscription, backend=backend
+            )
+            # In the Mixed view the cost-state is the strict aggregate, but
+            # the component call rows remain useful audit evidence. Show all
+            # of them without attributing their cost to any backend or agent.
+            filter_detail_backend = backend not in ("all", BACKEND_MIXED)
+            backend_join = " AND u.backend=?" if filter_detail_backend else ""
+            detail_params: tuple[Any, ...] = (
+                (backend, session_id) if filter_detail_backend else (session_id,)
+            )
             agents = conn.execute(
                 f"""SELECT a.*,
                    COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
-                   COALESCE(SUM(u.input_tokens),0) input_tokens,
-                   COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,
-                   COALESCE(SUM(u.output_tokens),0) output_tokens,
-                   COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,
-                   COALESCE(SUM(u.total_tokens),0) total_tokens,
-                   SUM({cost}) known_cost_usd,
-                   SUM(u.id IS NOT NULL AND {unknown}) unknown_cost_records,
+                   COALESCE(SUM(CASE WHEN u.source_event_type!='claude_cost_state'
+                       THEN u.input_tokens ELSE 0 END),0) input_tokens,
+                   COALESCE(SUM(CASE WHEN u.source_event_type!='claude_cost_state'
+                       THEN u.cached_input_tokens ELSE 0 END),0) cached_input_tokens,
+                   COALESCE(SUM(CASE WHEN u.source_event_type!='claude_cost_state'
+                       THEN u.output_tokens ELSE 0 END),0) output_tokens,
+                   COALESCE(SUM(CASE WHEN u.source_event_type!='claude_cost_state'
+                       THEN u.reasoning_output_tokens ELSE 0 END),0) reasoning_tokens,
+                   COALESCE(SUM(CASE WHEN u.source_event_type!='claude_cost_state'
+                       THEN u.total_tokens ELSE 0 END),0) total_tokens,
+                   SUM(CASE WHEN u.source_event_type!='claude_cost_state' THEN {cost} END) known_cost_usd,
+                   SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'
+                       AND {unknown}) unknown_cost_records,
                    CAST(strftime('%s',COALESCE(MAX(u.timestamp),a.updated_at))
                         -strftime('%s',COALESCE(MIN(u.timestamp),a.created_at)) AS INTEGER) duration_seconds,
                    GROUP_CONCAT(DISTINCT u.model) models_used
-                   FROM agents a LEFT JOIN usage u ON u.thread_id=a.thread_id WHERE a.session_id=?
+                   FROM agents a LEFT JOIN usage u ON u.thread_id=a.thread_id{backend_join}
+                   WHERE a.session_id=?
                    GROUP BY a.thread_id ORDER BY COALESCE(a.agent_path,'/root'),a.created_at""",
-                (session_id,),
+                detail_params,
             ).fetchall()
+            usage_backend = " AND backend=?" if filter_detail_backend else ""
+            usage_params: tuple[Any, ...] = (
+                (session_id, backend) if filter_detail_backend else (session_id,)
+            )
             model_rows = conn.execute(
                 f"""SELECT model,GROUP_CONCAT(DISTINCT backend) backends,COUNT(DISTINCT thread_id) agents,
-                   SUM(source_event_type!='claude_cost_state') usage_events,SUM(input_tokens) input_tokens,
-                   SUM(cached_input_tokens) cached_input_tokens,SUM(output_tokens) output_tokens,
-                   SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
+                   SUM(source_event_type!='claude_cost_state') usage_events,{input_tokens} input_tokens,
+                   {cached_tokens} cached_input_tokens,{output_tokens} output_tokens,
+                   {reasoning_tokens} reasoning_tokens,{total_tokens} total_tokens,
                    SUM({cost}) known_cost_usd,SUM({unknown}) unknown_cost_records
-                   FROM usage u WHERE session_id=? GROUP BY model ORDER BY known_cost_usd DESC""",
-                (session_id,),
+                   FROM usage u WHERE session_id=?{usage_backend}
+                   GROUP BY model ORDER BY known_cost_usd DESC""",
+                usage_params,
             ).fetchall()
             event_rows = conn.execute(
-                "SELECT * FROM usage WHERE session_id=? ORDER BY timestamp,source_ordinal LIMIT 500", (session_id,)
+                f"SELECT * FROM usage WHERE session_id=?{usage_backend} ORDER BY timestamp,source_ordinal",
+                usage_params,
             ).fetchall()
+            session_has_cost_state = bool(conn.execute(
+                "SELECT 1 FROM usage WHERE session_id=? AND source_event_type='claude_cost_state' LIMIT 1",
+                (session_id,),
+            ).fetchone())
             tags = [r[0] for r in conn.execute(
                 "SELECT t.name FROM tags t JOIN session_tags st ON st.tag_id=t.id "
                 "WHERE st.session_id=? ORDER BY t.name",
@@ -507,7 +609,8 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             backend=backend, include_subscription=include_subscription, session=session,
             agents=agent_rows,
             models=model_rows, model_composition=_model_composition(model_rows), events=events,
-            tags=tags, refresh=10 if session["status"] == "running" else None,
+            tags=tags, session_has_unallocated_cost=session_has_cost_state,
+            refresh=10 if session["status"] == "running" else None,
         )
 
     @app.post("/sessions/{session_id}/tags")
@@ -534,21 +637,26 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         backend = _backend(backend)
         source_where, source_params = _source_usage_clause(source, backend)
         cost, unknown = cost_sql(include_subscription)
+        strict_unknown = _strict_unknown_cost(unknown)
+        total_tokens = token_sum_sql("total_tokens")
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
                 f"""SELECT model,provider,backend,COUNT(DISTINCT session_id) sessions,
                    COUNT(DISTINCT thread_id) agents,
                    SUM(source_event_type!='claude_cost_state') usage_events,
-                   SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,
-                   SUM(cached_input_tokens) cached_input_tokens,
-                   SUM({cost}) known_cost_usd,SUM({unknown}) unknown_cost_records,
-                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
+                   {total_tokens} total_tokens,{input_tokens} input_tokens,
+                   {cached_tokens} cached_input_tokens,
+                   SUM({cost}) known_cost_usd,SUM({strict_unknown}) unknown_cost_records,
+                   CASE WHEN SUM({strict_unknown})=0
+                        THEN SUM({cost})/COUNT(DISTINCT session_id) END average_cost
                    FROM usage u WHERE {source_where} GROUP BY model,provider,backend
                    ORDER BY known_cost_usd DESC""",
                 source_params,
             ).fetchall()
             daily = conn.execute(
-                f"""SELECT date(timestamp,'localtime'),model,SUM({cost}),SUM({unknown})
+                f"""SELECT date(timestamp,'localtime'),model,SUM({cost}),SUM({strict_unknown})
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
                    HAVING date(timestamp,'localtime') IS NOT NULL ORDER BY 1,2""",
                 source_params,
@@ -572,16 +680,28 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         if backend != "all":
             source_where += " AND u.backend=?"
             source_params = (*source_params, backend)
+            if backend != BACKEND_MIXED:
+                source_where += (
+                    " AND NOT EXISTS(SELECT 1 FROM usage mixed_state "
+                    "WHERE mixed_state.session_id=s.id "
+                    "AND mixed_state.source_event_type='claude_cost_state' "
+                    "AND mixed_state.backend='mixed')"
+                )
         cost, unknown = cost_sql(include_subscription)
+        strict_unknown = f"(({unknown}) OR s.accounting_status NOT IN ('complete','estimated'))"
+        total_tokens = token_sum_sql("total_tokens")
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
                 f"""SELECT COALESCE(s.repo_name,s.cwd,'unknown') project,COUNT(DISTINCT s.id) sessions,
-                   SUM(u.total_tokens) total_tokens,SUM({cost}) known_cost_usd,
-                   SUM(u.id IS NOT NULL AND {unknown}) unknown_cost_records,
-                   SUM({cost})/COUNT(DISTINCT s.id) average_cost,
+                   {total_tokens} total_tokens,SUM({cost}) known_cost_usd,
+                   SUM(u.id IS NOT NULL AND {strict_unknown}) unknown_cost_records,
+                   CASE WHEN SUM(u.id IS NOT NULL AND {strict_unknown})=0
+                        THEN SUM({cost})/COUNT(DISTINCT s.id) END average_cost,
                    COUNT(DISTINCT u.thread_id) agents,
                    COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
-                   100.0*SUM(u.cached_input_tokens)/NULLIF(SUM(u.input_tokens),0) cached_pct
+                   100.0*{cached_tokens}/NULLIF({input_tokens},0) cached_pct
                    FROM sessions s LEFT JOIN usage u ON u.session_id=s.id WHERE {source_where}
                    GROUP BY project ORDER BY known_cost_usd DESC""",
                 source_params,
@@ -599,30 +719,36 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         backend = _backend(backend)
         source_where, source_params = _source_usage_clause(source, backend)
         cost, unknown = cost_sql(include_subscription)
+        strict_unknown = _strict_unknown_cost(unknown)
+        total_tokens = token_sum_sql("total_tokens")
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
         with database(settings.database, readonly=True) as conn:
             daily = conn.execute(
                 f"""SELECT date(timestamp,'localtime') period,SUM({cost}) cost,
-                   SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
-                   SUM({unknown}) unknown_cost_records,
-                   100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
-                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
+                   {total_tokens} tokens,COUNT(DISTINCT session_id) sessions,
+                   SUM({strict_unknown}) unknown_cost_records,
+                   100.0*{cached_tokens}/NULLIF({input_tokens},0) cached_pct,
+                   CASE WHEN SUM({strict_unknown})=0
+                        THEN SUM({cost})/COUNT(DISTINCT session_id) END average_cost
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime')
                    HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             weekly = conn.execute(
                 f"""SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM({cost}) cost,
-                   SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
-                   SUM({unknown}) unknown_cost_records,
-                   100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
-                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
+                   {total_tokens} tokens,COUNT(DISTINCT session_id) sessions,
+                   SUM({strict_unknown}) unknown_cost_records,
+                   100.0*{cached_tokens}/NULLIF({input_tokens},0) cached_pct,
+                   CASE WHEN SUM({strict_unknown})=0
+                        THEN SUM({cost})/COUNT(DISTINCT session_id) END average_cost
                    FROM usage u WHERE {source_where} GROUP BY strftime('%Y-W%W',timestamp,'localtime')
                    HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             by_model = conn.execute(
                 f"""SELECT date(timestamp,'localtime') period,model,SUM({cost}) cost,
-                   SUM(total_tokens) tokens,SUM({unknown}) unknown_cost_records
+                   {total_tokens} tokens,SUM({strict_unknown}) unknown_cost_records
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
                    HAVING period IS NOT NULL ORDER BY period,model""",
                 source_params,
@@ -642,17 +768,25 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         backend = _backend(backend)
         selected = session[:4]
         cost, unknown = cost_sql(include_subscription)
+        strict_unknown = _strict_unknown_cost(unknown)
         with database(settings.database, readonly=True) as conn:
-            rows = [session_detail(conn, sid, include_subscription=include_subscription) for sid in selected]
+            rows = [
+                session_detail(
+                    conn, sid, include_subscription=include_subscription, backend=backend
+                )
+                for sid in selected
+            ]
             rows = [
                 row for row in rows
                 if row is not None and (source == "all" or row["source_app"] == source)
             ]
             selected = [row["id"] for row in rows]
+            model_backend = "" if backend == "all" else " AND backend=?"
             model_costs = {
                 sid: {r[0]: (r[1], r[2]) for r in conn.execute(
-                    f"""SELECT model,SUM({cost}),SUM({unknown})
-                       FROM usage u WHERE session_id=? GROUP BY model""", (sid,)
+                    f"""SELECT model,SUM({cost}),SUM({strict_unknown})
+                       FROM usage u WHERE session_id=?{model_backend} GROUP BY model""",
+                    (sid,) if backend == "all" else (sid, backend),
                 )} for sid in selected
             }
             compared_models = sorted({model for costs in model_costs.values() for model in costs})

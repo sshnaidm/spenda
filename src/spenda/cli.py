@@ -16,13 +16,13 @@ from . import __version__
 from .config import CLAUDE_BILLING_MODES, Settings
 from .db import database, initialize
 from .ingestion.claude import claude_auth_profile, discover_claude_home
-from .ingestion.claude_auth import BACKEND_LABELS, BACKENDS
+from .ingestion.claude_auth import BACKEND_LABELS, BACKEND_MIXED, BACKENDS
 from .ingestion.codex_state import read_state
 from .ingestion.opencode import discover_opencode_database
 from .ingestion.scanner import discover_rollouts
 from .ingestion.service import ingest_all as ingest
 from .pricing import add_price, reprice_usage, seed_prices
-from .reports import as_dict, cost_sql, format_cost, format_tokens, iso_date, session_rows
+from .reports import as_dict, cost_sql, format_cost, format_tokens, iso_date, session_rows, token_sum_sql
 
 log = logging.getLogger("spenda")
 SOURCE_CHOICES = ("all", "codex", "opencode", "claude")
@@ -137,6 +137,7 @@ def _print_ingest(summary) -> None:
     print(f"Duplicate records ignored: {summary.duplicate_records}")
     print(f"Unknown models: {', '.join(sorted(summary.unknown_models)) or '0'}")
     print(f"Unknown prices: {', '.join(sorted(summary.unknown_prices)) or '0'}")
+    print(f"Source-recorded spend added: ${getattr(summary, 'recorded_spend', 0):.4f}")
     print(f"Estimated spend added: ${summary.estimated_spend:.4f}")
     claude = getattr(summary, "claude", summary)
     if getattr(claude, "subscription_value", 0):
@@ -270,6 +271,11 @@ def _session_filter(source: str, backend: str) -> tuple[str, tuple]:
     if backend != "all":
         clauses.append("EXISTS(SELECT 1 FROM usage ub WHERE ub.session_id=s.id AND ub.backend=?)")
         params.append(backend)
+        if backend != BACKEND_MIXED:
+            clauses.append(
+                "NOT EXISTS(SELECT 1 FROM usage um WHERE um.session_id=s.id "
+                "AND um.source_event_type='claude_cost_state' AND um.backend='mixed')"
+            )
     return " AND ".join(clauses) or "1=1", tuple(params)
 
 
@@ -282,7 +288,7 @@ def sessions_command(
         where, params = _session_filter(source, backend)
         rows = session_rows(
             conn, where=where, params=params, order=sort, limit=limit,
-            include_subscription=include_subscription,
+            include_subscription=include_subscription, backend=backend,
         )
     print(
         f"{'Started':16}  {'Source':8} {'Backend':16} {'Task':38}  {'Project':20}  "
@@ -343,21 +349,41 @@ def _export_rows(
         return format(Decimal(real or "0") + Decimal(value or "0"), "f")
 
     if breakdown == "models":
-        where, params = _session_filter(source, backend)
+        clauses, params = ["1=1"], []
+        if source != "all":
+            clauses.append("s.source_app=?")
+            params.append(source)
+        if backend != "all":
+            clauses.append("u.backend=?")
+            params.append(backend)
+            if backend != BACKEND_MIXED:
+                clauses.append(
+                    "NOT EXISTS(SELECT 1 FROM usage um WHERE um.session_id=u.session_id "
+                    "AND um.source_event_type='claude_cost_state' AND um.backend='mixed')"
+                )
+        where = " AND ".join(clauses)
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
+        cache_write_tokens = token_sum_sql("cache_write_input_tokens")
+        uncached_tokens = token_sum_sql("uncached_input_tokens")
+        output_tokens = token_sum_sql("output_tokens")
+        reasoning_tokens = token_sum_sql("reasoning_output_tokens")
+        total_tokens = token_sum_sql("total_tokens")
         rows = conn.execute(
             f"""SELECT u.session_id,s.source_app,u.model,u.provider,u.backend,u.billing_mode,
                COUNT(DISTINCT u.thread_id) agent_count,
                SUM(source_event_type!='claude_cost_state') usage_events,
-               SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
-               SUM(cache_write_input_tokens) cache_write_input_tokens,SUM(uncached_input_tokens) uncached_input_tokens,
-               SUM(output_tokens) output_tokens,SUM(reasoning_output_tokens) reasoning_tokens,
-               SUM(total_tokens) total_tokens,SUM({cost_column}) known_cost_usd,
-               SUM({unknown}) unknown_cost_records,
+               {input_tokens} input_tokens,{cached_tokens} cached_input_tokens,
+               {cache_write_tokens} cache_write_input_tokens,{uncached_tokens} uncached_input_tokens,
+               {output_tokens} output_tokens,{reasoning_tokens} reasoning_tokens,
+               {total_tokens} total_tokens,SUM({cost_column}) known_cost_usd,
+               SUM(({unknown}) OR s.accounting_status NOT IN ('complete','estimated'))
+                   unknown_cost_records,
                SUM(CAST(u.equivalent_cost_usd AS REAL)) equivalent_cost_usd
                FROM usage u JOIN sessions s ON s.id=u.session_id
                WHERE {where} GROUP BY u.session_id,s.source_app,u.model,u.provider,u.backend,u.billing_mode
                ORDER BY u.session_id,u.model""",
-            params,
+            tuple(params),
         ).fetchall()
         output = []
         for row in rows:
@@ -373,10 +399,16 @@ def _export_rows(
     output = []
     session_where, session_params = _session_filter(source, backend)
     for row in session_rows(
-        conn, where=session_where, params=session_params, include_subscription=include_subscription
+        conn, where=session_where, params=session_params, include_subscription=include_subscription,
+        backend=backend,
     ):
         data = as_dict(row)
-        known_exact = exact_total("session_id=?", (data["id"],))
+        exact_where = "session_id=?"
+        exact_params: tuple = (data["id"],)
+        if backend != "all":
+            exact_where += " AND backend=?"
+            exact_params = (*exact_params, backend)
+        known_exact = exact_total(exact_where, exact_params)
         output.append({
             "session_id": data["id"], "source_app": data["source_app"], "root_backend": data["root_backend"],
             "date": data["created_at"], "title": data["title"],
@@ -389,7 +421,9 @@ def _export_rows(
             "cost_usd": None if data["unknown_cost_records"] else known_exact,
             "known_cost_usd": known_exact,
             "unknown_cost_records": data["unknown_cost_records"],
-            "equivalent_cost_usd": exact_cost("session_id=?", (data["id"],), "equivalent_cost_usd"),
+            "equivalent_cost_usd": exact_cost(
+                exact_where, exact_params, "equivalent_cost_usd"
+            ),
             "unknown_value_records": data["unknown_value_records"],
             "accounting_status": data["accounting_status"],
             "duration_seconds": data["duration_seconds"],

@@ -70,6 +70,14 @@ def _assistant(
     )
 
 
+def _user(*, session: str, timestamp: str, uuid: str = "prompt-1", origin: str = "human") -> str:
+    return _line(
+        kind="user", session=session, timestamp=timestamp, uuid=uuid,
+        origin={"kind": origin}, promptSource="typed" if origin == "human" else "system",
+        message={"role": "user", "content": "private user prompt"},
+    )
+
+
 def _oauth_home(home: Path) -> None:
     """Give the Claude home a claude.ai subscription login profile."""
 
@@ -105,6 +113,7 @@ def _fixture(home: Path, *, cost_state: str = "complete") -> tuple[Path, Path]:
     child.parent.mkdir(parents=True)
     root.parent.mkdir(parents=True, exist_ok=True)
     records = [
+            _user(session="root", timestamp="2026-09-01T09:59:59Z"),
             _assistant(
                 session="root", message_id="message-root", timestamp="2026-09-01T10:00:00Z",
                 input_tokens=1, output_tokens=1, git_branch="main", effort="high",
@@ -122,13 +131,21 @@ def _fixture(home: Path, *, cost_state: str = "complete") -> tuple[Path, Path]:
             _line(
                 kind="cost-state", session="root", timestamp="2026-09-01T10:00:02Z",
                 startTime=1788256802000, totalCostUSD=1.5,
-                modelUsage={"claude-test": {"costUSD": 1.5}},
+                modelUsage={"claude-test": {
+                    "costUSD": 1.5, "inputTokens": 10, "cacheReadInputTokens": 4,
+                    "cacheCreationInputTokens": 6, "outputTokens": 12, "thinkingTokens": 6,
+                }},
                 hasUnknownModelCost=cost_state == "unknown",
             )
         )
     root.write_text("\n".join(records) + "\n", encoding="utf-8")
     child.write_text(
+        # Claude copies shared history into subagent transcripts. This is the
+        # same API response as the root's final streaming snapshot.
         _assistant(
+            session="root", message_id="message-root", timestamp="2026-09-01T10:00:01Z",
+            input_tokens=4, output_tokens=5,
+        ) + "\n" + _assistant(
             session="root", message_id="message-child", timestamp="2026-09-01T10:00:03Z",
             input_tokens=6, output_tokens=7, effort="low",
         ) + "\n",
@@ -165,6 +182,8 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
 
     assert discover_claude_home(settings) == home.resolve()
     assert (summary.root_sessions, summary.subagent_sessions, summary.usage_records) == (1, 1, 3)
+    assert summary.recorded_spend == pytest.approx(1.5)
+    assert summary.estimated_spend == 0
     # Every call is covered by the root cost-state, so no price is needed.
     assert summary.unknown_prices == set()
     with database(settings.database, readonly=True) as conn:
@@ -185,19 +204,32 @@ def test_claude_ingestion_keeps_only_accounting_and_latest_message(tmp_path):
         cost_label = conn.execute(
             "SELECT turn_id,response_id,call_label FROM usage WHERE source_event_type='claude_cost_state'"
         ).fetchone()
+        counted = conn.execute(
+            "SELECT source_event_type,counts_toward_totals FROM usage ORDER BY source_event_type"
+        ).fetchall()
 
     assert paths == {
         "claude:root": "/root",
         "claude:root:agent:agent-child": "/root/agent-child",
     }
     assert tuple(usage) == (9, 2, 3, 4, 5, 3, 14, "0")
-    assert tuple(cost) == ("1.5", 0, "2026-09-01T10:00:02Z", str(home / "projects" / "-work-repo" / "root.jsonl"))
-    assert tuple(session) == (2, None, "claude", "2.1.263", "main", "high")
+    assert tuple(cost) == ("1.5", 32, "2026-09-01T10:00:02Z", str(home / "projects" / "-work-repo" / "root.jsonl"))
+    assert tuple(session) == (1, None, "claude", "2.1.263", "main", "high")
 
     with database(settings.database, readonly=True) as conn:
         efforts = dict(conn.execute("SELECT thread_id,reasoning_effort FROM agents"))
     assert efforts == {"claude:root": "high", "claude:root:agent:agent-child": "low"}
     assert detail["usage_events"] == 2
+    assert (
+        detail["input_tokens"], detail["cached_input_tokens"], detail["cache_write_input_tokens"],
+        detail["uncached_input_tokens"], detail["output_tokens"], detail["reasoning_tokens"],
+        detail["total_tokens"],
+    ) == (20, 4, 6, 10, 12, 6, 32)
+    assert [tuple(row) for row in counted] == [
+        ("claude_assistant_message", 0),
+        ("claude_assistant_message", 0),
+        ("claude_cost_state", 1),
+    ]
     assert tuple(cost_label) == (None, None, "Cumulative cost state")
     assert {path: path.read_bytes() for path in source_bytes} == source_bytes
     with sqlite3.connect(settings.database) as conn:
@@ -274,6 +306,34 @@ def test_claude_derives_fixed_action_labels_without_persisting_content(tmp_path)
         "private final response", "another private response",
     ):
         assert private_value not in logical_dump
+
+
+def test_claude_counts_only_structured_human_prompts(tmp_path):
+    home = tmp_path / "claude"
+    _write_root(
+        home, "root",
+        _user(session="root", timestamp="2026-09-01T10:00:00Z", uuid="prompt-1"),
+        _user(session="root", timestamp="2026-09-01T10:00:01Z", uuid="prompt-2"),
+        _user(
+            session="root", timestamp="2026-09-01T10:00:02Z",
+            uuid="notification", origin="task-notification",
+        ),
+        _assistant(
+            session="root", message_id="message-root", timestamp="2026-09-01T10:00:03Z",
+            input_tokens=1, output_tokens=1,
+        ),
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    ingest_claude(settings)
+
+    with database(settings.database, readonly=True) as conn:
+        row = conn.execute(
+            "SELECT turn_count,first_user_message_preview FROM sessions WHERE id='claude:root'"
+        ).fetchone()
+        dump = "\n".join(conn.iterdump())
+    assert tuple(row) == (2, None)
+    assert "private user prompt" not in dump
 
 
 def test_claude_skips_non_utf8_line_and_imports_surrounding_records(tmp_path):
@@ -575,6 +635,73 @@ def test_claude_cost_snapshots_preserve_historical_daily_changes(tmp_path):
     ]
 
 
+def test_bedrock_cost_state_and_message_models_share_one_canonical_id(tmp_path):
+    home = tmp_path / "claude"
+    _write_root(
+        home, "root",
+        _assistant(
+            session="root", message_id="msg_bdrk_01", timestamp="2026-09-01T10:00:00Z",
+            model="claude-opus-4-6", input_tokens=1, output_tokens=1,
+        ),
+        _line(
+            kind="cost-state", session="root", timestamp="2026-09-01T10:00:01Z",
+            totalCostUSD=2,
+            modelUsage={"us.anthropic.claude-opus-4-6-v1": {
+                "costUSD": 2, "inputTokens": 10, "cacheReadInputTokens": 4,
+                "cacheCreationInputTokens": 6, "outputTokens": 12, "thinkingTokens": 3,
+            }},
+            hasUnknownModelCost=False,
+        ),
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    summary = ingest_claude(settings)
+
+    with database(settings.database, readonly=True) as conn:
+        rows = conn.execute(
+            "SELECT model,COUNT(*),SUM(counts_toward_totals*total_tokens),"
+            "SUM(CAST(cost_usd AS REAL)) FROM usage GROUP BY model"
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [("claude-opus-4-6", 2, 32, 2.0)]
+    assert summary.recorded_spend == pytest.approx(2)
+    assert summary.estimated_spend == 0
+
+
+def test_zero_cost_state_is_retained_as_authoritative_evidence(tmp_path):
+    home = tmp_path / "claude"
+    _write_root(
+        home, "root",
+        _assistant(
+            session="root", message_id="msg_bdrk_01", timestamp="2026-09-01T10:00:00Z",
+            model="claude-opus-4-6", input_tokens=1, output_tokens=1,
+        ),
+        _assistant(
+            session="root", message_id="msg_vrtx_01", timestamp="2026-09-01T10:00:01Z",
+            model="claude-opus-4-6", input_tokens=2, output_tokens=1,
+        ),
+        _line(
+            kind="cost-state", session="root", timestamp="2026-09-01T10:00:02Z",
+            totalCostUSD=0, modelUsage={}, hasUnknownModelCost=False,
+        ),
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+
+    summary = ingest_claude(settings)
+
+    with database(settings.database, readonly=True) as conn:
+        state = conn.execute(
+            "SELECT model,backend,cost_usd,counts_toward_totals FROM usage "
+            "WHERE source_event_type='claude_cost_state'"
+        ).fetchone()
+        session = conn.execute(
+            "SELECT root_backend,accounting_status FROM sessions WHERE id='claude:root'"
+        ).fetchone()
+    assert tuple(state) == ("claude-opus-4-6", "mixed", "0", 0)
+    assert tuple(session) == ("mixed", "complete")
+    assert summary.recorded_spend == 0
+    assert summary.estimated_spend == 0
+
+
 def test_complete_root_reconciles_costs_when_another_transcript_is_malformed(tmp_path):
     home = tmp_path / "claude"
     root, child = _fixture(home)
@@ -679,7 +806,7 @@ def test_unchanged_transcripts_are_skipped_until_a_file_changes(tmp_path, monkey
     assert (third.unchanged_files, third.usage_records, third.duplicate_records) == (0, 1, 3)
     with database(settings.database, readonly=True) as conn:
         assert conn.execute(
-            "SELECT COUNT(*) FROM usage WHERE source_record_identity='claude:root:agent-child:message-child-2'"
+                "SELECT COUNT(*) FROM usage WHERE source_record_identity='claude:root:root:message-child-2'"
         ).fetchone()[0] == 1
         assert conn.execute(
             "SELECT updated_at FROM sessions WHERE id='claude:root'"
@@ -723,9 +850,9 @@ def test_reconciliation_leaves_skipped_unit_alone_while_changed_unit_is_replaced
             "SELECT source_record_identity FROM usage WHERE source_record_identity LIKE 'claude:%'"
         ))
     assert identities == [
-        "claude:cost:root:3:claude-test",
+        "claude:cost:root:4:claude-test",
         "claude:other:root:message-replaced",
-        "claude:root:agent-child:message-child",
+        "claude:root:root:message-child",
         "claude:root:root:message-root",
     ]
 
@@ -829,7 +956,7 @@ def test_unchanged_history_pass_opens_no_transcript_files(tmp_path, monkeypatch)
     assert (third.unchanged_files, sorted(p.name for p in opened)) == (38, ["agent-7.jsonl", "session-7.jsonl"])
 
 
-def test_vertex_unit_without_cost_state_is_estimated_from_list_prices(tmp_path):
+def test_vertex_unit_without_cost_state_stays_unpriced_in_strict_mode(tmp_path):
     home = tmp_path / "claude"
     _write_root(
         home, "vertex-root",
@@ -846,26 +973,25 @@ def test_vertex_unit_without_cost_state_is_estimated_from_list_prices(tmp_path):
     backend, billing, cost, equivalent, priced, write_1h, note = _usage_row(
         settings, "claude:vertex-root:root:msg_vrtx_01"
     )
-    # 1000*5 + 2000*0.5 + 3000*6.25 + 500*25 per MTok = 0.03725, plus the
-    # 1-hour cache-write uplift of 1000 tokens * 5 * 0.75 = 0.00375.
     assert (backend, billing, cost, equivalent, priced, write_1h) == (
-        "vertex", "metered", Decimal("0.041"), None, 1, 1000,
+        "vertex", "metered", None, None, 0, 1000,
     )
-    assert note.startswith("estimated from built-in Anthropic list price")
-    assert "1h cache-write uplift applied to 1000 tokens" in note
+    assert note.startswith("strict accounting: vertex backend/region price")
     with database(settings.database, readonly=True) as conn:
         session = conn.execute(
             "SELECT root_backend,accounting_status,accounting_note FROM sessions WHERE id='claude:vertex-root'"
         ).fetchone()
         agent = conn.execute("SELECT backend FROM agents WHERE thread_id='claude:vertex-root'").fetchone()
     assert tuple(session) == (
-        "vertex", "estimated",
-        "Claude Code transcript has no cumulative cost-state; priced from built-in Anthropic list prices",
+        "vertex", "partial",
+        "Claude Code transcript has no cumulative cost-state",
     )
     assert agent[0] == "vertex"
-    assert summary.unknown_prices == set()
+    assert summary.unknown_prices == {
+        "vertex:claude-opus-4-8:backend-price-unavailable"
+    }
     assert summary.backends == {"vertex": 1}
-    assert summary.estimated_records == 1 and summary.estimated_spend == pytest.approx(0.041)
+    assert summary.estimated_records == 0 and summary.estimated_spend == 0
     assert summary.subscription_value == 0
 
 
@@ -917,6 +1043,7 @@ def test_subscription_unit_keeps_equivalent_value_with_zero_real_cost(tmp_path):
     assert statuses == {"claude:oauth-root": "complete", "claude:oauth-open": "estimated"}
     assert tuple(totals) == (0.0, 12.5)
     assert summary.subscription_value == pytest.approx(12.5) and summary.estimated_spend == 0
+    assert summary.recorded_spend == 0
 
 
 def test_billing_override_and_profile_change_relabel_unchanged_units(tmp_path, monkeypatch):
@@ -928,20 +1055,32 @@ def test_billing_override_and_profile_change_relabel_unchanged_units(tmp_path, m
             model="claude-opus-5", input_tokens=1_000_000, output_tokens=0, cache_read=0, cache_write=0,
         ),
     )
+    vertex = _write_root(
+        home, "vertex-root",
+        _assistant(
+            session="vertex-root", message_id="msg_vrtx_01", timestamp="2026-09-01T10:00:00Z",
+            model="claude-opus-5", input_tokens=1, output_tokens=1,
+        ),
+    )
     settings = _Settings(tmp_path / "dashboard.sqlite", home)
 
     ingest_claude(settings)
-    assert _usage_row(settings, "claude:root:root:msg_01")[:4] == ("anthropic", "metered", Decimal("5"), None)
+    assert _usage_row(settings, "claude:root:root:msg_01")[:4] == (
+        "anthropic", "metered", None, None,
+    )
 
     # Logging in changes how msg_ calls are billed; the unchanged transcript
-    # must be reread so its rows are relabeled.
+    # with Anthropic-direct rows must be reread so its rows are relabeled,
+    # while the Vertex unit is unaffected and is not reopened.
     _oauth_home(home)
+    _forbid_open(monkeypatch, vertex)
     summary = ingest_claude(settings)
-    assert summary.unchanged_files == 0
+    assert summary.unchanged_files == 1
+    monkeypatch.undo()
     assert _usage_row(settings, "claude:root:root:msg_01")[:4] == (
         "anthropic-oauth", "subscription", Decimal("0"), Decimal("5"),
     )
-    assert ingest_claude(settings).unchanged_files == 1
+    assert ingest_claude(settings).unchanged_files == 2
 
     forced = _Settings(tmp_path / "dashboard.sqlite", home)
     forced.claude_billing = "api"
@@ -977,14 +1116,17 @@ def test_mixed_backend_unit_and_fast_mode_rows(tmp_path):
     unknown = _usage_row(settings, "claude:root:root:msg_03")
     assert unknown[:5] == ("anthropic", "metered", None, None, 0)
     assert unknown[6].startswith("no built-in Anthropic price for claude-future")
-    assert summary.unknown_prices == {"anthropic:claude-opus-5:fast", "anthropic:claude-future"}
+    assert summary.unknown_prices == {
+        "anthropic:claude-opus-5:fast", "anthropic:claude-future",
+        "vertex:claude-opus-5:backend-price-unavailable",
+    }
     with database(settings.database, readonly=True) as conn:
         session = conn.execute(
             "SELECT root_backend,accounting_status,accounting_note FROM sessions WHERE id='claude:root'"
         ).fetchone()
     assert tuple(session) == (
         "mixed", "partial",
-        "Claude Code transcript has no cumulative cost-state; some records have no built-in Anthropic price",
+        "Claude Code transcript has no cumulative cost-state",
     )
 
     cost_state = _line(
@@ -1028,6 +1170,11 @@ def test_reprice_touches_only_estimated_claude_rows(tmp_path):
             session="oauth-root", message_id="msg_01", timestamp="2026-09-01T10:00:00Z",
             model="claude-future", input_tokens=1_000_000, output_tokens=0, cache_read=0, cache_write=0,
         ),
+        _assistant(
+            session="oauth-root", message_id="msg_02", timestamp="2026-09-01T10:00:01Z",
+            model="claude-future", input_tokens=1_000_000, output_tokens=0, cache_read=0, cache_write=0,
+            speed="fast",
+        ),
     )
     settings = _Settings(tmp_path / "dashboard.sqlite", home)
     ingest_claude(settings)
@@ -1052,6 +1199,10 @@ def test_reprice_touches_only_estimated_claude_rows(tmp_path):
     assert _usage_row(settings, "claude:oauth-root:root:msg_01")[:5] == (
         "anthropic-oauth", "subscription", Decimal("0"), Decimal("2"), 1,
     )
+    # Fast-mode rows bill at a premium the table does not carry; they stay unpriced.
+    fast = _usage_row(settings, "claude:oauth-root:root:msg_02")
+    assert fast[:5] == ("anthropic-oauth", "subscription", Decimal("0"), None, 0)
+    assert fast[6] == "fast-mode request; standard list price not applicable"
 
 
 def test_parser_version_bump_rereads_previously_fingerprinted_units(tmp_path, monkeypatch):

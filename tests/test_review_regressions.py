@@ -150,7 +150,7 @@ def test_unknown_cost_is_ignored_in_trend_totals(dashboard_settings):
     route = next(route.endpoint for route in app.routes if route.path == "/trends")
     body = route(request).body.decode().split("<main>", 1)[1]
     assert "$0.0000" in body
-    assert "+ unknown" not in body
+    assert ">=$" not in body
 
 
 def test_invalid_usage_timestamp_does_not_break_date_based_pages(dashboard_settings):

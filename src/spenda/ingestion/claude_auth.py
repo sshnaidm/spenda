@@ -29,6 +29,7 @@ BACKEND_UNKNOWN = "unknown"
 # Every backend value a Claude row can carry, in display order.
 BACKENDS = (
     BACKEND_ANTHROPIC_OAUTH, BACKEND_ANTHROPIC_API, BACKEND_ANTHROPIC, BACKEND_VERTEX, BACKEND_BEDROCK,
+    BACKEND_MIXED, BACKEND_UNKNOWN,
 )
 BACKEND_LABELS = {
     BACKEND_ANTHROPIC_OAUTH: "Claude subscription",
@@ -86,12 +87,13 @@ class ClaudeAuthProfile:
             return BACKEND_ANTHROPIC_OAUTH
         if self.override == "api":
             return BACKEND_ANTHROPIC_API
-        # A login profile outranks a key hint: Claude Code prefers the
-        # subscription when both exist; doctor reports the ambiguity.
+        # Claude Code's documented credential precedence puts an active API
+        # key/token/helper ahead of the subscription OAuth login.  A stale
+        # approval-history entry is not evidence that a key is still active.
+        if self.api_key_hint:
+            return BACKEND_ANTHROPIC_API
         if self.oauth:
             return BACKEND_ANTHROPIC_OAUTH
-        if self.api_key_hint or self.api_key_history:
-            return BACKEND_ANTHROPIC_API
         return BACKEND_ANTHROPIC
 
     @property

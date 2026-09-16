@@ -105,6 +105,8 @@ def test_opencode_paths_totals_and_turn_count(tmp_path):
     summary = ingest_opencode(settings)
 
     assert (summary.root_sessions, summary.subagent_sessions, summary.usage_records) == (1, 2, 3)
+    assert summary.recorded_spend == 0.75
+    assert summary.estimated_spend == 0
     with database(settings.database, readonly=True) as conn:
         paths = dict(conn.execute("SELECT thread_id,agent_path FROM agents"))
         usage = conn.execute(

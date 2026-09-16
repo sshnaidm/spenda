@@ -132,3 +132,8 @@ def test_estimate_cost_uplifts_one_hour_cache_writes_and_strips_context_suffix(t
     assert uplifted.note == "1h cache-write uplift applied to 4000 tokens"
     assert unknown.total_usd is None
     assert price_model("claude-opus-5[1m]") == "claude-opus-5" and price_model("claude-opus-5") == "claude-opus-5"
+    assert price_model("anthropic.claude-opus-4-6-v1:0") == "claude-opus-4-6"
+    assert price_model("us.anthropic.claude-opus-4-6-v1") == "claude-opus-4-6"
+    assert price_model("global.anthropic.claude-opus-4-5-20251101-v1:0") == "claude-opus-4-5"
+    assert price_model("claude-haiku-4-5@20251001") == "claude-haiku-4-5"
+    assert price_model("unrelated-v1") == "unrelated-v1"

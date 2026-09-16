@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -86,8 +87,8 @@ ANTHROPIC_PRICE_SOURCE = "https://platform.claude.com/docs/en/about-claude/prici
 # uplifted per record from the transcript's cache_creation split.  1M-context
 # models bill the full window at standard rates, so no long-context threshold.
 _ANTHROPIC_NOTE = (
-    "Anthropic list price captured 2026-09-15; Vertex AI and Bedrock reuse it. Cache write is "
-    "the 5m rate, 1h writes are uplifted at ingest; fast mode and server tools are not modeled."
+    "First-party Anthropic list price captured 2026-09-15. Cache write is the 5m rate; "
+    "1h writes are uplifted at ingest. Partner-cloud, fast-mode, and server-tool prices are not modeled."
 )
 _ANTHROPIC_FROM = "2025-09-01T00:00:00Z"
 BUILTIN_PRICES += tuple(
@@ -127,11 +128,34 @@ BUILTIN_ALIASES = (
 # Claude Code labels 1M-context requests with a "[1m]" suffix; the price is the
 # model's standard rate across the full window.
 _CONTEXT_SUFFIX = "[1m]"
+# Fast-mode requests bill at a premium the price table does not carry; the
+# note marks rows that must stay unpriced when standard prices are applied.
+FAST_MODE_NOTE = "fast-mode request; standard list price not applicable"
+
+
+_BEDROCK_MODEL_PREFIX = re.compile(r"^(?:(?:global|us|eu|apac)\.)?anthropic\.")
+_BEDROCK_MODEL_VERSION = re.compile(r"-v\d+(?::\d+)?$")
 
 
 def price_model(model: str) -> str:
-    """Return the model id used for price lookup (only strips the [1m] suffix)."""
-    return model[: -len(_CONTEXT_SUFFIX)] if model.endswith(_CONTEXT_SUFFIX) else model
+    """Return a stable Anthropic/OpenAI model id for storage and lookup.
+
+    Claude cost-state uses backend-specific names such as
+    ``us.anthropic.claude-opus-4-6-v1`` while message records use
+    ``claude-opus-4-6``.  Normalize those spellings before aggregation so one
+    model does not appear as separate zero-call and zero-cost rows.
+    """
+
+    normalized = model[: -len(_CONTEXT_SUFFIX)] if model.endswith(_CONTEXT_SUFFIX) else model
+    bedrock_model = _BEDROCK_MODEL_PREFIX.match(normalized) is not None
+    normalized = _BEDROCK_MODEL_PREFIX.sub("", normalized)
+    if bedrock_model:
+        normalized = _BEDROCK_MODEL_VERSION.sub("", normalized)
+    aliases = {
+        alias: canonical for alias, canonical, provider in BUILTIN_ALIASES
+        if provider == "anthropic"
+    }
+    return aliases.get(normalized, normalized)
 
 
 def seed_prices(conn: sqlite3.Connection) -> None:
@@ -265,14 +289,16 @@ def reprice_usage(
     # OpenCode and Claude Code cost-state rows carry source-owned accounting and
     # are never repriced.  Claude call rows are repriced only when they were
     # estimated from list prices (or still unpriced); rows whose dollars are
-    # represented by a cumulative cost-state record keep their zero cost.
+    # represented by a cumulative cost-state record keep their zero cost, and
+    # fast-mode rows stay unpriced because standard prices do not apply.
     clauses, params = [
         "source_event_type NOT GLOB 'opencode_*'",
         "source_event_type!='claude_cost_state'",
         "(source_event_type!='claude_assistant_message' OR price_id IS NOT NULL"
         " OR (billing_mode='subscription' AND equivalent_cost_usd IS NULL)"
         " OR (billing_mode!='subscription' AND cost_usd IS NULL))",
-    ], []
+        "COALESCE(pricing_note,'')!=?",
+    ], [FAST_MODE_NOTE]
     if model is not None:
         clauses.append("model=?")
         params.append(model)

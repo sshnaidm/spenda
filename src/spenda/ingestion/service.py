@@ -24,6 +24,7 @@ class CombinedIngestSummary:
     unknown_models: set[str] = field(default_factory=set)
     unknown_prices: set[str] = field(default_factory=set)
     estimated_spend: float = 0.0
+    recorded_spend: float = 0.0
     codex: IngestSummary | None = None
     opencode: OpenCodeIngestSummary | None = None
     claude: ClaudeIngestSummary | None = None
@@ -65,6 +66,7 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
         unknown_models=set().union(*(item.unknown_models for item in summaries)),
         unknown_prices=set().union(*(item.unknown_prices for item in summaries)),
         estimated_spend=sum(item.estimated_spend for item in summaries),
+        recorded_spend=sum(getattr(item, "recorded_spend", 0.0) for item in summaries),
         codex=codex,
         opencode=opencode,
         claude=claude,
