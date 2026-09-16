@@ -45,6 +45,8 @@ Start the dashboard with `spenda serve`. If you installed with uv, use `uv run s
 
 Choose **All sources**, **Codex**, **OpenCode**, or **Claude Code** from the dashboard filter. The Sessions view lets you inspect individual sessions; Models and Projects show aggregate usage. Use the theme switcher to choose light or dark mode.
 
+Claude Code usage is also split by API backend: **Vertex AI**, **Bedrock**, **Anthropic API** (API key), and **Claude subscription** (claude.ai login). Pick one from the Backend row to see, for example, only Vertex AI spend. Subscription usage has no metered charge, so it shows as $0 real spend with its equivalent API value alongside; **Include subscription value** adds that value to every total. The same filters are available as `spenda sessions --backend vertex` and `spenda export --backend anthropic-oauth --include-subscription`. Sessions that Claude Code did not close with a cost record are priced from built-in list prices and marked `est.`; `spenda doctor` shows which login and backends were detected, and `--claude-billing subscription|api` overrides the detection for copied histories. See [docs/data-sources.md](docs/data-sources.md) for what is read and [docs/accounting.md](docs/accounting.md) for the formulas.
+
 To use a non-default history location, set the matching environment variable before running a command:
 
 ```bash

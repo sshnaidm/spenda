@@ -18,15 +18,28 @@ from typing import Any
 
 from ..config import Settings
 from ..db import database, initialize
+from ..models import CostResult, TokenUsage
+from ..pricing import estimate_cost, price_model, seed_prices, subscription_split
 from .action_labels import prefer_action_label, safe_action_label
+from .claude_auth import (
+    BACKEND_ANTHROPIC,
+    BACKEND_ANTHROPIC_OAUTH,
+    BACKEND_MIXED,
+    ClaudeAuthProfile,
+    message_backend,
+    read_auth_profile,
+)
 
 SOURCE_APP = "claude"
+PROVIDER = "anthropic"
 _PREFIX = "claude:"
 _ASSISTANT_EVENT = "claude_assistant_message"
 _COST_EVENT = "claude_cost_state"
+_META_AUTH_BACKEND = "claude_auth_backend"
+_COVERED_NOTE = "cost represented by cumulative Claude Code cost-state"
 # Bump when the values derived from a transcript change, so recorded
 # fingerprints from an older parser stop suppressing a reread.
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -44,6 +57,10 @@ class ClaudeIngestSummary:
     unknown_prices: set[str] = field(default_factory=set)
     estimated_spend: float = 0.0
     source_home: Path | None = None
+    estimated_records: int = 0
+    subscription_value: float = 0.0
+    backends: dict[str, int] = field(default_factory=dict)
+    auth_profile: ClaudeAuthProfile | None = None
 
 
 @dataclass(slots=True)
@@ -59,6 +76,7 @@ class _Transcript:
     git_branch: str | None = None
     reasoning_effort: str | None = None
     title: str | None = None
+    backends: set[str] = field(default_factory=set)
 
     @property
     def is_subagent(self) -> bool:
@@ -82,6 +100,9 @@ class _AssistantRecord:
     source_path: Path
     ordinal: int
     call_label: str
+    backend: str
+    cache_write_1h: int = 0
+    fast: bool = False
 
 
 @dataclass(slots=True)
@@ -168,6 +189,34 @@ def discover_claude_home(settings: Settings) -> Path:
 
     configured = getattr(settings, "claude_home", None)
     return Path(configured or Path.home() / ".claude").expanduser().resolve()
+
+
+def claude_auth_profile(settings: Settings) -> ClaudeAuthProfile:
+    """Read the non-secret login profile of the configured Claude home."""
+
+    return read_auth_profile(
+        discover_claude_home(settings), override=getattr(settings, "claude_billing", "auto")
+    )
+
+
+def _unit_backend(backends: set[str]) -> str | None:
+    """Collapse the backends seen in a transcript or unit into one label."""
+
+    if not backends:
+        return None
+    return next(iter(backends)) if len(backends) == 1 else BACKEND_MIXED
+
+
+def _read_meta(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM dashboard_meta WHERE key=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def _write_meta(conn, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO dashboard_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
 
 
 def _ns(value: str) -> str:
@@ -370,11 +419,20 @@ def _read_transcript(
                 previous = assistant.get(identity)
                 if previous is not None:
                     call_label = prefer_action_label(previous.call_label, call_label) or call_label
+                # The API backend is visible only in the identifier prefixes.
+                backend = message_backend(message_id, record.get("requestId"))
+                transcript.backends.add(backend)
+                cache_creation = usage.get("cache_creation")
+                cache_write_1h = (
+                    _safe_int(cache_creation.get("ephemeral_1h_input_tokens"))
+                    if isinstance(cache_creation, dict) else 0
+                )
                 # Same message appears several times while streaming.  Keeping
                 # the latest transcript line avoids the observed overcounting.
                 assistant[identity] = _AssistantRecord(
                     identity, _ns(transcript.root_external_id), transcript.thread_id,
                     timestamp, model, usage, transcript.path, ordinal, call_label,
+                    backend, cache_write_1h, usage.get("speed") == "fast",
                 )
             elif kind == "cost-state" and not transcript.is_subagent:
                 model_usage = record.get("modelUsage")
@@ -419,30 +477,35 @@ def _ensure_session(conn, *, root_id: str, source_home: Path, version: str | Non
     )
 
 
-def _upsert_transcript(conn, transcript: _Transcript, source_home: Path, root_seen: bool) -> None:
+def _upsert_transcript(
+    conn, transcript: _Transcript, source_home: Path, root_seen: bool, *,
+    backend: str | None, root_backend: str | None,
+) -> None:
     root_id = _ns(transcript.root_external_id)
     _ensure_session(conn, root_id=root_id, source_home=source_home, version=transcript.version)
     if not transcript.is_subagent:
         conn.execute(
             """UPDATE sessions SET title=?,cwd=?,repo_root=?,repo_name=?,git_branch=?,
                created_at=?,updated_at=?,root_model=?,root_reasoning_effort=?,
-               root_provider='anthropic' WHERE id=?""",
+               root_provider=?,root_backend=? WHERE id=?""",
             (
                 transcript.title or "Claude Code session", transcript.cwd, transcript.cwd,
                 _project_name(transcript.cwd), transcript.git_branch, transcript.created_at,
-                transcript.updated_at, transcript.root_model, transcript.reasoning_effort, root_id,
+                transcript.updated_at, transcript.root_model, transcript.reasoning_effort,
+                PROVIDER, root_backend, root_id,
             ),
         )
     conn.execute(
         """INSERT INTO agents(thread_id,session_id,parent_thread_id,agent_role,agent_nickname,
-           agent_path,created_at,updated_at,model,model_provider,reasoning_effort,source_rollout_path,
-           source_kind,orphan,source_available)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
+           agent_path,created_at,updated_at,model,model_provider,backend,reasoning_effort,
+           source_rollout_path,source_kind,orphan,source_available)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)
            ON CONFLICT(thread_id) DO UPDATE SET
              session_id=excluded.session_id,parent_thread_id=excluded.parent_thread_id,
              agent_role=excluded.agent_role,agent_nickname=excluded.agent_nickname,
              agent_path=excluded.agent_path,created_at=excluded.created_at,updated_at=excluded.updated_at,
-             model=COALESCE(excluded.model,agents.model),model_provider='anthropic',
+             model=COALESCE(excluded.model,agents.model),model_provider=excluded.model_provider,
+             backend=excluded.backend,
              reasoning_effort=COALESCE(excluded.reasoning_effort,agents.reasoning_effort),
              source_rollout_path=excluded.source_rollout_path,source_kind=excluded.source_kind,
              orphan=excluded.orphan,source_available=1""",
@@ -452,14 +515,18 @@ def _upsert_transcript(conn, transcript: _Transcript, source_home: Path, root_se
             "subagent" if transcript.is_subagent else "root",
             transcript.agent_external_id,
             f"/root/{transcript.agent_external_id}" if transcript.is_subagent else "/root",
-            transcript.created_at, transcript.updated_at, transcript.root_model, "anthropic",
+            transcript.created_at, transcript.updated_at, transcript.root_model, PROVIDER, backend,
             transcript.reasoning_effort,
             str(transcript.path), SOURCE_APP, int(transcript.is_subagent and not root_seen),
         ),
     )
 
 
-def _usage_values(record: _AssistantRecord, *, covered_by_cost_state: bool) -> tuple[Any, ...]:
+def _billing_mode(backend: str | None) -> str:
+    return "subscription" if backend == BACKEND_ANTHROPIC_OAUTH else "metered"
+
+
+def _token_usage(record: _AssistantRecord) -> TokenUsage:
     usage = record.usage
     uncached = _safe_int(usage.get("input_tokens"))
     cached = _safe_int(usage.get("cache_read_input_tokens"))
@@ -467,15 +534,56 @@ def _usage_values(record: _AssistantRecord, *, covered_by_cost_state: bool) -> t
     output = _safe_int(usage.get("output_tokens"))
     details = usage.get("output_tokens_details")
     reasoning = _safe_int(details.get("thinking_tokens")) if isinstance(details, dict) else 0
+    return TokenUsage(
+        uncached + cached + cache_write, cached, cache_write, output, reasoning,
+        uncached + cached + cache_write + output,
+    )
+
+
+def _usage_values(
+    record: _AssistantRecord, *, covered_by_cost_state: bool, cost: CostResult | None,
+) -> tuple[Any, ...]:
+    """Build the usage row; dollars come from exactly one of cost-state or estimate."""
+
+    tokens = _token_usage(record)
+    billing = _billing_mode(record.backend)
+    subscription = billing == "subscription"
+    price_id = None
+    components: tuple[str | None, ...] = (None, None, None, None)
+    if covered_by_cost_state:
+        cost_usd, equivalent = "0", ("0" if subscription else None)
+        note = _COVERED_NOTE
+    elif record.fast:
+        cost_usd, equivalent = ("0", None) if subscription else (None, None)
+        note = "fast-mode request; standard list price not applicable"
+    elif cost is not None and cost.price_id is not None:
+        price_id = cost.price_id
+        components = tuple(
+            str(value) for value in
+            (cost.uncached_input_usd, cost.cached_input_usd, cost.cache_write_usd, cost.output_usd)
+        )
+        cost_usd, equivalent = subscription_split(str(cost.total_usd), subscription)
+        note = (
+            "subscription usage: real cost $0; equivalent API value estimated from built-in Anthropic list price"
+            if subscription
+            else "estimated from built-in Anthropic list price; no complete cost-state covers this message"
+        )
+        if cost.note:
+            note = f"{note}; {cost.note}"
+    else:
+        cost_usd, equivalent = ("0", None) if subscription else (None, None)
+        note = (
+            f"no built-in Anthropic price for {record.model}; "
+            "Claude transcript has no complete cumulative cost-state"
+        )
     return (
         record.identity, record.session_id, record.thread_id, record.identity, record.identity,
-        record.timestamp, record.model, "anthropic", uncached + cached + cache_write, cached,
-        cache_write, uncached, output, reasoning, uncached + cached + cache_write + output,
+        record.timestamp, record.model, PROVIDER, record.backend, billing,
+        tokens.input_tokens, tokens.cached_input_tokens, tokens.cache_write_input_tokens,
+        record.cache_write_1h, tokens.uncached_input_tokens, tokens.output_tokens,
+        tokens.reasoning_output_tokens, tokens.total_tokens,
         str(record.source_path), record.ordinal, _ASSISTANT_EVENT, record.call_label,
-        None, None, None, None, None,
-        "0" if covered_by_cost_state else None,
-        "cost represented by cumulative Claude Code cost-state" if covered_by_cost_state
-        else "Claude transcript has no complete cumulative cost-state",
+        price_id, *components, cost_usd, equivalent, note,
     )
 
 
@@ -484,23 +592,27 @@ def _upsert_usage(conn, values: tuple[Any, ...]) -> bool:
     exists = conn.execute("SELECT 1 FROM usage WHERE source_record_identity=?", (identity,)).fetchone()
     conn.execute(
         """INSERT INTO usage(source_record_identity,session_id,thread_id,turn_id,response_id,
-           timestamp,model,provider,input_tokens,cached_input_tokens,cache_write_input_tokens,
-           uncached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_file,
-           source_ordinal,source_event_type,call_label,price_id,uncached_input_usd,cached_input_usd,
-           cache_write_usd,output_usd,cost_usd,pricing_note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           timestamp,model,provider,backend,billing_mode,input_tokens,cached_input_tokens,
+           cache_write_input_tokens,cache_write_1h_input_tokens,uncached_input_tokens,output_tokens,
+           reasoning_output_tokens,total_tokens,source_file,source_ordinal,source_event_type,call_label,
+           price_id,uncached_input_usd,cached_input_usd,cache_write_usd,output_usd,cost_usd,
+           equivalent_cost_usd,pricing_note)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(source_record_identity) DO UPDATE SET
              session_id=excluded.session_id,thread_id=excluded.thread_id,turn_id=excluded.turn_id,
              response_id=excluded.response_id,timestamp=excluded.timestamp,model=excluded.model,
-             provider=excluded.provider,input_tokens=excluded.input_tokens,
-             cached_input_tokens=excluded.cached_input_tokens,
+             provider=excluded.provider,backend=excluded.backend,billing_mode=excluded.billing_mode,
+             input_tokens=excluded.input_tokens,cached_input_tokens=excluded.cached_input_tokens,
              cache_write_input_tokens=excluded.cache_write_input_tokens,
+             cache_write_1h_input_tokens=excluded.cache_write_1h_input_tokens,
              uncached_input_tokens=excluded.uncached_input_tokens,output_tokens=excluded.output_tokens,
              reasoning_output_tokens=excluded.reasoning_output_tokens,total_tokens=excluded.total_tokens,
              source_file=excluded.source_file,source_ordinal=excluded.source_ordinal,
              source_event_type=excluded.source_event_type,call_label=excluded.call_label,
-             price_id=NULL,uncached_input_usd=NULL,
-             cached_input_usd=NULL,cache_write_usd=NULL,output_usd=NULL,cost_usd=excluded.cost_usd,
-             pricing_note=excluded.pricing_note""",
+             price_id=excluded.price_id,uncached_input_usd=excluded.uncached_input_usd,
+             cached_input_usd=excluded.cached_input_usd,cache_write_usd=excluded.cache_write_usd,
+             output_usd=excluded.output_usd,cost_usd=excluded.cost_usd,
+             equivalent_cost_usd=excluded.equivalent_cost_usd,pricing_note=excluded.pricing_note""",
         values,
     )
     return exists is not None
@@ -538,24 +650,34 @@ def _cost_changes(
 
 def _upsert_cost(
     conn, *, identity: str, root_id: str, model: str, source_path: Path,
-    cost: Decimal, timestamp: str | None, ordinal: int,
+    cost: Decimal, timestamp: str | None, ordinal: int, backend: str | None,
 ) -> bool:
     exists = conn.execute("SELECT 1 FROM usage WHERE source_record_identity=?", (identity,)).fetchone()
+    billing = _billing_mode(backend)
+    cost_usd, equivalent = subscription_split(format(cost, "f"), billing == "subscription")
+    note = "Change between Claude Code cumulative cost-state snapshots"
+    if billing == "subscription":
+        note += " (subscription equivalent value)"
+    elif backend == BACKEND_MIXED:
+        note += " (mixed backends; cost-state cannot be split)"
     conn.execute(
         """INSERT INTO usage(source_record_identity,session_id,thread_id,turn_id,response_id,
-           timestamp,model,provider,input_tokens,cached_input_tokens,cache_write_input_tokens,
-           uncached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_file,
-           source_ordinal,source_event_type,call_label,price_id,uncached_input_usd,cached_input_usd,
-           cache_write_usd,output_usd,cost_usd,pricing_note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           timestamp,model,provider,backend,billing_mode,input_tokens,cached_input_tokens,
+           cache_write_input_tokens,uncached_input_tokens,output_tokens,reasoning_output_tokens,
+           total_tokens,source_file,source_ordinal,source_event_type,call_label,price_id,
+           uncached_input_usd,cached_input_usd,cache_write_usd,output_usd,cost_usd,equivalent_cost_usd,
+           pricing_note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(source_record_identity) DO UPDATE SET timestamp=excluded.timestamp,model=excluded.model,
+             backend=excluded.backend,billing_mode=excluded.billing_mode,
              turn_id=NULL,response_id=NULL,call_label=excluded.call_label,
              source_file=excluded.source_file,source_ordinal=excluded.source_ordinal,cost_usd=excluded.cost_usd,
-             pricing_note=excluded.pricing_note""",
+             equivalent_cost_usd=excluded.equivalent_cost_usd,pricing_note=excluded.pricing_note""",
         (
             identity, root_id, root_id, None, None,
-            timestamp or datetime.now(UTC).isoformat(), model, "anthropic", 0, 0, 0, 0, 0, 0, 0,
+            timestamp or datetime.now(UTC).isoformat(), price_model(model), PROVIDER, backend, billing,
+            0, 0, 0, 0, 0, 0, 0,
             str(source_path), ordinal, _COST_EVENT, "Cumulative cost state", None, None, None, None, None,
-            format(cost, "f"), "Change between Claude Code cumulative cost-state snapshots",
+            cost_usd, equivalent, note,
         ),
     )
     return exists is not None
@@ -636,14 +758,24 @@ def _refresh_turn_counts(conn) -> None:
     )
 
 
-def _refresh_coverage(conn, coverage: dict[str, tuple[bool, str]]) -> None:
-    """Mark whether cumulative cost-state accounts for each Claude session."""
+def _refresh_coverage(conn, coverage: dict[str, tuple[str, str]]) -> None:
+    """Record how each Claude session's dollars are accounted for."""
 
-    for root_id, (complete, note) in coverage.items():
+    for root_id, (status, note) in coverage.items():
         conn.execute(
             "UPDATE sessions SET accounting_status=?,accounting_note=? WHERE id=?",
-            ("complete" if complete else "partial", None if complete else note, root_id),
+            (status, note or None, root_id),
         )
+
+
+def _estimate_status(base_note: str, priced: int, total: int) -> tuple[str, str]:
+    """Describe a unit whose dollars come from list prices instead of cost-state."""
+
+    if total and priced == total:
+        return "estimated", f"{base_note}; priced from built-in Anthropic list prices"
+    if priced:
+        return "partial", f"{base_note}; some records have no built-in Anthropic price"
+    return "partial", base_note
 
 
 def _session_liveness(updated_at: str | None, running_window_seconds: int, now: datetime) -> tuple[str, str | None]:
@@ -676,7 +808,8 @@ def ingest_claude(
 
     settings.validate()
     home = discover_claude_home(settings)
-    summary = ClaudeIngestSummary(source_home=home)
+    profile = claude_auth_profile(settings)
+    summary = ClaudeIngestSummary(source_home=home, auth_profile=profile)
     projects = home / "projects"
     discovery = _transcript_paths(home, summary)
     if discovery is None:
@@ -698,6 +831,12 @@ def ingest_claude(
     scan_now = (now or datetime.now(UTC)).astimezone(UTC)
     running_window = int(getattr(settings, "running_window_seconds", 0))
     with database(settings.database) as conn:
+        seed_prices(conn)
+        # A changed login profile relabels every ``msg_`` call, so units that
+        # would otherwise be skipped as unchanged must be reread once.
+        previous_auth = _read_meta(conn, _META_AUTH_BACKEND)
+        if previous_auth != profile.anthropic_backend:
+            force_all = True
         # Reading the recorded fingerprints does not open a write transaction,
         # so the dashboard database stays unlocked while transcripts are read.
         stored = {} if force_all else _stored_fingerprints(conn)
@@ -747,6 +886,24 @@ def ingest_claude(
             group_complete[root] = complete
         scan_complete = discovery_complete and all(group_complete.values())
 
+        # Transcripts only know that a call went to Anthropic directly; the
+        # login profile says whether that is a subscription or an API key.
+        for record in assistants.values():
+            if record.backend == BACKEND_ANTHROPIC:
+                record.backend = profile.anthropic_backend
+        for transcript in readable_transcripts:
+            if BACKEND_ANTHROPIC in transcript.backends:
+                transcript.backends.discard(BACKEND_ANTHROPIC)
+                transcript.backends.add(profile.anthropic_backend)
+        unit_backends: dict[str, str | None] = {}
+        for transcript in readable_transcripts:
+            unit_backends[transcript.root_external_id] = _unit_backend(
+                set().union(*(
+                    item.backends for item in readable_transcripts
+                    if item.root_external_id == transcript.root_external_id
+                ))
+            )
+
         current_transcript_ids = {item.thread_id for item in transcripts}
         readable_roots = {item.root_external_id for item in readable_transcripts}
         for root in readable_roots:
@@ -758,7 +915,11 @@ def ingest_claude(
                 conn, root_id=_ns(root), source_home=home, version=root_item.version if root_item else None
             )
         for transcript in readable_transcripts:
-            _upsert_transcript(conn, transcript, home, transcript.root_external_id in root_files)
+            _upsert_transcript(
+                conn, transcript, home, transcript.root_external_id in root_files,
+                backend=_unit_backend(transcript.backends),
+                root_backend=unit_backends.get(transcript.root_external_id),
+            )
         # A child can continue producing messages after the root has become
         # idle.  Liveness belongs to the task/session, so use the latest
         # envelope timestamp across every transcript associated with that root.
@@ -781,48 +942,68 @@ def ingest_claude(
                     "UPDATE sessions SET updated_at=?,status=?,finished_at=? WHERE id=?",
                     (latest, status, finished_at, root_id),
                 )
-        coverage: dict[str, tuple[bool, str]] = {}
+        # A root cost-state is Claude Code's own cumulative total for the whole
+        # session, subagent calls included (observed: models that only appear
+        # in subagent transcripts are listed in the root's cost-state).  Units
+        # without any cost-state are priced from list prices instead; a unit
+        # never gets both, so dollars are not counted twice.
+        coverage_notes: dict[str, str] = {}
         root_cost_coverage: dict[str, bool] = {}
-        child_usage_sessions = {
-            record.session_id for record in assistants.values()
-            if record.thread_id != record.session_id
-        }
+        estimable_roots: set[str] = set()
         for root in readable_roots:
             root_id = _ns(root)
             states = cost_states.get(root, [])
             state = states[-1] if states else None
             if state is None:
-                coverage[root_id] = (False, "Claude Code transcript has no cumulative cost-state")
+                coverage_notes[root_id] = "Claude Code transcript has no cumulative cost-state"
+                estimable_roots.add(root_id)
             elif state.complete:
                 root_cost_coverage[root_id] = root_id in complete_transcript_ids
-                if root_id in child_usage_sessions:
-                    coverage[root_id] = (
-                        False,
-                        "Claude Code root cost-state does not prove coverage of subagent transcript usage",
-                    )
-                else:
-                    coverage[root_id] = (True, "")
+                coverage_notes[root_id] = ""
             else:
-                coverage[root_id] = (
-                    False,
-                    "Claude Code cost-state reports unknown model cost; cumulative session cost is partial",
+                coverage_notes[root_id] = (
+                    "Claude Code cost-state reports unknown model cost; cumulative session cost is partial"
                 )
+        priced_by_root: dict[str, list[int]] = {}
         for record in assistants.values():
-            covered_by_root_cost = (
-                root_cost_coverage.get(record.session_id, False)
-                and record.thread_id == record.session_id
-            )
-            if not covered_by_root_cost:
-                summary.unknown_prices.add(f"anthropic:{record.model}")
-            if _upsert_usage(
-                conn,
-                _usage_values(
-                    record, covered_by_cost_state=covered_by_root_cost
-                ),
-            ):
+            covered = root_cost_coverage.get(record.session_id, False)
+            cost = None
+            # Orphaned subagent transcripts have no root and no cost-state, so
+            # their rows are estimated like any unit without a cost-state.
+            estimable = record.session_id in estimable_roots or record.session_id not in coverage_notes
+            if not covered and estimable and not record.fast:
+                cost = estimate_cost(
+                    conn, _token_usage(record), record.model, PROVIDER, record.timestamp,
+                    cache_write_1h_tokens=record.cache_write_1h,
+                )
+            priced = covered or (cost is not None and cost.price_id is not None)
+            if not priced:
+                summary.unknown_prices.add(
+                    f"{PROVIDER}:{record.model}:fast" if record.fast else f"{PROVIDER}:{record.model}"
+                )
+            counts = priced_by_root.setdefault(record.session_id, [0, 0])
+            counts[0] += int(priced and not covered)
+            counts[1] += 1
+            summary.backends[record.backend] = summary.backends.get(record.backend, 0) + 1
+            values = _usage_values(record, covered_by_cost_state=covered, cost=cost)
+            if _upsert_usage(conn, values):
                 summary.duplicate_records += 1
             else:
                 summary.usage_records += 1
+                if cost is not None and cost.total_usd is not None:
+                    summary.estimated_records += 1
+                    if _billing_mode(record.backend) == "subscription":
+                        summary.subscription_value += float(cost.total_usd)
+                    else:
+                        summary.estimated_spend += float(cost.total_usd)
+        coverage: dict[str, tuple[str, str]] = {}
+        for root_id, note in coverage_notes.items():
+            if root_cost_coverage.get(root_id):
+                coverage[root_id] = ("complete", "")
+            elif root_id in estimable_roots:
+                coverage[root_id] = _estimate_status(note, *priced_by_root.get(root_id, [0, 0]))
+            else:
+                coverage[root_id] = ("partial", note)
         current_usage_ids = set(assistants)
         cost_ids_by_root: dict[str, set[str]] = {}
         for root, states in cost_states.items():
@@ -840,9 +1021,13 @@ def ingest_claude(
                     conn, identity=identity, root_id=root_id, model=model,
                     source_path=state.source_path, cost=cost,
                     timestamp=state.timestamp, ordinal=state.ordinal,
+                    backend=unit_backends.get(root),
                 )
                 if existed:
                     summary.duplicate_records += 1
+                elif _billing_mode(unit_backends.get(root)) == "subscription":
+                    summary.usage_records += 1
+                    summary.subscription_value += float(cost)
                 else:
                     summary.usage_records += 1
                     summary.estimated_spend += float(cost)
@@ -882,6 +1067,7 @@ def ingest_claude(
             scan_now.isoformat(),
         )
         _refresh_turn_counts(conn)
+        _write_meta(conn, _META_AUTH_BACKEND, profile.anthropic_backend)
         summary.scanned_sessions = len(transcripts)
         summary.root_sessions = int(conn.execute(
             "SELECT COUNT(*) FROM sessions WHERE source_app='claude' AND id LIKE 'claude:%'"

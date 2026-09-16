@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     root_model TEXT,
     root_reasoning_effort TEXT,
     root_provider TEXT,
+    root_backend TEXT,
     source_app TEXT NOT NULL DEFAULT 'codex',
     source_home TEXT NOT NULL,
     source_version TEXT,
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS agents (
     updated_at TEXT,
     model TEXT,
     model_provider TEXT,
+    backend TEXT,
     reasoning_effort TEXT,
     source_rollout_path TEXT,
     source_kind TEXT,
@@ -90,9 +92,12 @@ CREATE TABLE IF NOT EXISTS usage (
     timestamp TEXT NOT NULL,
     model TEXT NOT NULL,
     provider TEXT NOT NULL,
+    backend TEXT,
+    billing_mode TEXT NOT NULL DEFAULT 'metered',
     input_tokens INTEGER NOT NULL,
     cached_input_tokens INTEGER NOT NULL,
     cache_write_input_tokens INTEGER NOT NULL,
+    cache_write_1h_input_tokens INTEGER NOT NULL DEFAULT 0,
     uncached_input_tokens INTEGER NOT NULL,
     output_tokens INTEGER NOT NULL,
     reasoning_output_tokens INTEGER NOT NULL,
@@ -107,6 +112,7 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_write_usd TEXT,
     output_usd TEXT,
     cost_usd TEXT,
+    equivalent_cost_usd TEXT,
     pricing_note TEXT
 );
 CREATE TABLE IF NOT EXISTS ingestion_state (
@@ -165,6 +171,7 @@ CREATE INDEX IF NOT EXISTS idx_usage_thread ON usage(thread_id);
 CREATE INDEX IF NOT EXISTS idx_usage_model_time ON usage(model, timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_timestamp ON usage(timestamp);
 CREATE INDEX IF NOT EXISTS idx_usage_response ON usage(response_id);
+CREATE INDEX IF NOT EXISTS idx_usage_backend ON usage(backend);
 """
 
 
@@ -201,6 +208,27 @@ def _migrate_session_source_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE sessions ADD COLUMN source_app TEXT NOT NULL DEFAULT 'codex'")
 
 
+def _migrate_backend_columns(conn: sqlite3.Connection) -> None:
+    """Add the v6 API-backend and billing columns to an existing database."""
+    additions = {
+        "sessions": (("root_backend", "TEXT"),),
+        "agents": (("backend", "TEXT"),),
+        "usage": (
+            ("backend", "TEXT"),
+            ("billing_mode", "TEXT NOT NULL DEFAULT 'metered'"),
+            ("cache_write_1h_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("equivalent_cost_usd", "TEXT"),
+        ),
+    }
+    for table, columns in additions.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if not existing:
+            continue
+        for name, definition in columns:
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+
+
 def initialize(path: Path) -> None:
     if path.exists() and path.stat().st_size:
         with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=0.2)) as existing:
@@ -211,6 +239,7 @@ def initialize(path: Path) -> None:
         # Upgrade before applying the complete schema, which includes an index
         # over ``source_app`` that does not exist in v3.
         _migrate_session_source_columns(conn)
+        _migrate_backend_columns(conn)
         conn.executescript(SCHEMA)
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
         if "accounting_status" not in session_columns:

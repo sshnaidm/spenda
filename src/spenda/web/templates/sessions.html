@@ -1,7 +1,7 @@
 {% extends "base.html" %}{% block title %}Coding agent sessions{% endblock %}{% block content %}
 <h1>Tasks / sessions</h1>
 <form class="filters" method="get">
-<input type="hidden" name="source" value="{{ source }}">
+<input type="hidden" name="source" value="{{ source }}"><input type="hidden" name="backend" value="{{ backend }}">{% if include_subscription %}<input type="hidden" name="include_subscription" value="1">{% endif %}
 <label>Start<input type="date" name="start" value="{{ request.query_params.get('start','') }}"></label><label>End<input type="date" name="end" value="{{ request.query_params.get('end','') }}"></label>
 <label>Project<select name="project"><option value="">All</option>{% for item in projects %}<option {{ 'selected' if request.query_params.get('project')==item }}>{{ item }}</option>{% endfor %}</select></label>
 <label>Actual model<select name="model"><option value="">All</option>{% for item in models %}<option {{ 'selected' if request.query_params.get('model')==item }}>{{ item }}</option>{% endfor %}</select></label>
@@ -10,5 +10,5 @@
 <label>Sort<select name="sort">{% for key,label in sort_labels.items() %}<option value="{{ key }}" {{ 'selected' if sort_key==key }}>{{ label }}</option>{% endfor %}</select></label><label>Direction<select name="direction"><option value="desc" {{ 'selected' if sort_direction=='desc' }}>Descending</option><option value="asc" {{ 'selected' if sort_direction=='asc' }}>Ascending</option></select></label>
 <label class="inline"><input type="checkbox" name="contains_astra" value="true" {{ 'checked' if request.query_params.get('contains_astra') }}>contains Astra</label><label class="inline"><input type="checkbox" name="subagents" value="true" {{ 'checked' if request.query_params.get('subagents') }}>subagents</label><button>Apply</button>
 </form>
-<form action="/compare" method="get"><input type="hidden" name="source" value="{{ source }}"><p><button>Compare selected</button> <span class="muted">Select 2–4 sessions.</span></p>{% set selectable=true %}{% include "_sessions_table.html" %}</form>
+<form action="/compare" method="get"><input type="hidden" name="source" value="{{ source }}"><input type="hidden" name="backend" value="{{ backend }}">{% if include_subscription %}<input type="hidden" name="include_subscription" value="1">{% endif %}<p><button>Compare selected</button> <span class="muted">Select 2–4 sessions.</span></p>{% set selectable=true %}{% include "_sessions_table.html" %}</form>
 {% endblock %}

@@ -114,4 +114,29 @@ OpenCode assistant messages already contain token categories and a client-calcul
 
 ## 11. Claude Code accounting
 
-Claude Code transcript usage records contain model and token categories. The importer deduplicates streaming updates by `(sessionId, message.id)` and keeps the latest record. Claude's `output_tokens` already includes thinking tokens; `thinking_tokens` is retained as a reasoning subset and is not added again. Claude `cost-state` records are cumulative, so consecutive snapshots are converted into dated cost changes whose sum equals the latest source total. This preserves historical period reporting without allocating cost to individual messages. Older or uncovered sessions remain unpriced. Subscription-backed figures are informational rather than an API invoice.
+Claude Code transcript usage records contain model and token categories. The importer deduplicates streaming updates by `(sessionId, message.id)` and keeps the latest record. Claude's `output_tokens` already includes thinking tokens; `thinking_tokens` is retained as a reasoning subset and is not added again. Claude `cost-state` records are cumulative, so consecutive snapshots are converted into dated cost changes whose sum equals the latest source total. This preserves historical period reporting without allocating cost to individual messages.
+
+A root `cost-state` is Claude Code's own total for the whole session. Observed transcripts show models that occur only in subagent transcripts listed in the root's `modelUsage`, and cost-state token counts at or above the sum of root and subagent records (the difference is helper calls that never reach a transcript). Every call of a session with a complete cost-state, root or subagent, therefore carries `cost_usd = 0` with the dollars on the cost-state rows, and the session is `complete`.
+
+Sessions without any cost-state (Claude Code versions before about 2.1.246, and sessions that are still running) are priced per call from the built-in Anthropic price rows and marked `estimated`. A session never receives both: calls are estimated only when no cost-state exists for the unit, and once a cost-state appears the unit is reread and the estimates are replaced. A session whose cost-state reports an unknown model cost keeps that partial total and is not estimated. Fast-mode calls (`usage.speed == "fast"`) are left unpriced because they bill at a premium rate.
+
+The built-in Anthropic rows (see section 12) apply to every backend because Vertex AI and Bedrock list the same per-token prices; the cost-state totals observed on Vertex AI reproduce those rates exactly for Opus 4.8 and Haiku 4.5. Regional-endpoint premiums, `inference_geo` multipliers, web-search fees, and helper calls that are absent from transcripts are not modeled, so estimates are lower bounds.
+
+## 12. API backend and subscription billing
+
+Each Claude row records the API backend detected from its identifiers (`vertex`, `bedrock`, `anthropic-oauth`, `anthropic-api`, or `anthropic`; see [data-sources.md](data-sources.md)). Vertex AI, Bedrock, and API-key calls are metered: their `cost_usd` is the cost-state change or the list-price estimate.
+
+Subscription calls (`anthropic-oauth`) have no metered charge, so `billing_mode = 'subscription'`, `cost_usd = 0`, and the value the same calls would have cost on the API is stored in `equivalent_cost_usd`, again from the cost-state when one exists and from list prices otherwise. Real-spend totals exclude it; with the "Include subscription value" toggle (`include_subscription=1`, `--include-subscription`) every cost expression becomes `cost_usd + equivalent_cost_usd`, and a subscription row without an equivalent value counts as unknown. A session that mixed backends keeps its cost-state rows metered because the cumulative total cannot be split.
+
+Built-in Anthropic prices captured 2026-09-15 from <https://platform.claude.com/docs/en/about-claude/pricing> (USD per million tokens; input / cache read / cache write / output):
+
+| Model | Input | Cache read | Cache write (5m) | Output |
+|---|---|---|---|---|
+| claude-fable-5-1 | 10 | 0.25 | 12.5 | 50 |
+| claude-fable-5 | 10 | 1 | 12.5 | 50 |
+| claude-opus-5, -4-8, -4-7, -4-6, -4-5 | 5 | 0.5 | 6.25 | 25 |
+| claude-sonnet-5 | 2 | 0.2 | 2.5 | 10 |
+| claude-sonnet-4-6, -4-5 | 3 | 0.3 | 3.75 | 15 |
+| claude-haiku-4-5 | 1 | 0.1 | 1.25 | 5 |
+
+The cache-write column is the 5-minute rate (1.25× input). One-hour cache writes cost 2× input, so `cache_write_1h_input_tokens × 0.75 × input_per_million / 1,000,000` is added per record. Dated snapshot ids and Vertex `@date` spellings (`claude-sonnet-4-5-20250929`, `claude-haiku-4-5@20251001`, ...) are explicit aliases; a `[1m]` suffix is stripped for lookup because 1M-context requests bill at the standard rate. The `2025-09-01` effective start is a local-history coverage floor, not a launch date. `spenda price-add --provider anthropic` adds a row and reprices estimated Claude calls only; cost-state-covered rows keep their zero cost.

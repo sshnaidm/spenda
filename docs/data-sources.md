@@ -72,12 +72,58 @@ label; content bodies and tool arguments are discarded.
 Assistant usage is keyed by `(sessionId, message.id)`. Streaming updates for
 the same message keep the latest record. Uncached input, cache-read input,
 cache-creation input, output, and thinking-token subsets map directly into the
-normalized token fields. Claude's output already includes thinking tokens.
+normalized token fields; the `cache_creation.ephemeral_1h_input_tokens` subset
+is kept as `cache_write_1h_input_tokens`. Claude's output already includes
+thinking tokens.
 
 `cost-state` records are cumulative. Consecutive snapshots become dated cost
 changes whose sum equals the latest source total, preserving historical trends
-without inventing per-message dollar allocations. A root cost state does not
-prove coverage of subagent usage, so those sessions remain partial.
+without inventing per-message dollar allocations. Claude Code's cumulative
+total covers the whole session including subagent calls (models that only
+appear in subagent transcripts are listed in the root's cost-state), so every
+call of a session with a complete cost-state is represented by that record.
+
+### API backend and billing
+
+Claude Code can talk to Anthropic directly, to Vertex AI, or to Amazon
+Bedrock, and a direct connection can be paid per token (API key) or covered by
+a claude.ai subscription (OAuth login). Every Claude usage row, agent, and
+session records a `backend` so these can be filtered and totaled separately:
+
+| `backend` | Detected from |
+|---|---|
+| `vertex` | `message.id` starts with `msg_vrtx_` or the envelope `requestId` starts with `req_vrtx_` |
+| `bedrock` | `message.id` starts with `msg_bdrk_` |
+| `anthropic-oauth` | `msg_` id and the home's login profile is a claude.ai subscription |
+| `anthropic-api` | `msg_` id and an API key is configured (or was previously approved) |
+| `anthropic` | `msg_` id and the login profile is unknown |
+| `mixed` | a session or transcript whose calls used several backends |
+
+Transcripts do not say whether a direct call was paid by subscription or API
+key, so the adapter reads a small allow-list of non-secret scalar fields from
+the installation's login profile: `oauthAccount.billingType`,
+`oauthAccount.organizationType`, and `oauthAccount.organizationName` plus
+whether `customApiKeyResponses.approved` is non-empty from `.claude.json`
+(inside `CLAUDE_CONFIG_DIR`, otherwise the `~/.claude.json` sibling of the
+home), and from `settings.json` the presence of `apiKeyHelper` or of the
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_VERTEX`,
+`CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_VERTEX_PROJECT_ID`, and `CLOUD_ML_REGION`
+variables in its `env` block or in the process environment. Only the names
+of key variables are inspected, never their values. `.credentials.json` holds
+tokens and is never opened. A login profile outranks an API-key hint; `spenda
+doctor` reports both and warns when they coexist.
+
+Because project directories are sometimes copied between machines, one home
+can hold sessions from several backends. Per-message detection is therefore
+primary, and the login profile only classifies `msg_` calls. When the profile
+is wrong for that history, `--claude-billing subscription|api` (or
+`SPENDA_CLAUDE_BILLING`) forces the classification. Changing the profile or
+the override rereads every unit once so existing rows are relabeled.
+
+Subscription usage has no metered charge. Its rows carry
+`billing_mode='subscription'`, a real `cost_usd` of `0`, and the list-price
+value of the calls in `equivalent_cost_usd`. Reports show real spend by
+default and offer an "Include subscription value" toggle.
 
 Claude scans import valid records from a readable transcript even when another
 line or transcript has an error. Destructive reconciliation is limited to

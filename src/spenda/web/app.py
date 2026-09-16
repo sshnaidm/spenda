@@ -16,9 +16,10 @@ from fastapi.templating import Jinja2Templates
 
 from ..config import Settings
 from ..db import database, initialize
+from ..ingestion.claude_auth import BACKEND_LABELS, BACKENDS
 from ..ingestion.service import ingest_all as ingest
 from ..pricing import seed_prices
-from ..reports import format_cost, format_duration, format_tokens, iso_date, session_detail, session_rows
+from ..reports import cost_sql, format_cost, format_duration, format_tokens, iso_date, session_detail, session_rows
 
 log = logging.getLogger(__name__)
 TEMPLATE_DIR = Path(__file__).with_name("templates")
@@ -31,9 +32,15 @@ MODEL_STYLES = {
     "claude-opus-5": "coral",
     "claude-haiku-4-5-20251001": "green",
     "claude-haiku-4-5@20251001": "green",
+    "claude-haiku-4-5": "green",
     "claude-opus-4-6": "purple",
+    "claude-opus-4-7": "indigo",
     "claude-sonnet-5": "orange",
     "claude-sonnet-4-5-20250929": "teal",
+    "claude-sonnet-4-5": "teal",
+    "claude-sonnet-4-6": "olive",
+    "claude-fable-5-1": "pink",
+    "claude-fable-5": "rust",
 }
 MODEL_PALETTE = (
     "blue", "coral", "green", "purple", "orange",
@@ -41,6 +48,9 @@ MODEL_PALETTE = (
 )
 SOURCES = ("all", "codex", "opencode", "claude")
 SOURCE_LABELS = {"all": "All", "codex": "Codex", "opencode": "OpenCode", "claude": "Claude Code"}
+# API backend filter for Claude Code rows; Codex and OpenCode rows have none.
+BACKEND_FILTERS = ("all", *BACKENDS)
+BACKEND_FILTER_LABELS = {"all": "All backends", **BACKEND_LABELS}
 SESSION_SORT_KEYS = (
     "started", "source", "title", "project", "root_model", "models", "agents", "input",
     "cached", "output", "total", "cost", "duration",
@@ -69,14 +79,39 @@ def _source(value: str) -> str:
     return value if value in SOURCES else "all"
 
 
-def _source_usage_clause(source: str, alias: str = "u") -> tuple[str, tuple[Any, ...]]:
-    if source == "all":
+def _backend(value: str) -> str:
+    return value if value in BACKEND_FILTERS else "all"
+
+
+def _source_usage_clause(source: str, backend: str = "all", alias: str = "u") -> tuple[str, tuple[Any, ...]]:
+    clauses, params = [], []
+    if source != "all":
+        clauses.append(
+            f"EXISTS(SELECT 1 FROM sessions source_session WHERE source_session.id={alias}.session_id "
+            "AND source_session.source_app=?)"
+        )
+        params.append(source)
+    if backend != "all":
+        clauses.append(f"{alias}.backend=?")
+        params.append(backend)
+    return " AND ".join(clauses) or "1=1", tuple(params)
+
+
+def _backend_session_clause(backend: str, alias: str = "s") -> tuple[str, tuple[Any, ...]]:
+    """Match sessions with at least one call on the backend (mixed units match each)."""
+    if backend == "all":
         return "1=1", ()
-    return (
-        f"EXISTS(SELECT 1 FROM sessions source_session WHERE source_session.id={alias}.session_id "
-        "AND source_session.source_app=?)",
-        (source,),
-    )
+    return f"EXISTS(SELECT 1 FROM usage ub WHERE ub.session_id={alias}.id AND ub.backend=?)", (backend,)
+
+
+def _query_suffix(source: str, backend: str, include_subscription: bool) -> str:
+    """Query string that carries the current filters between pages."""
+    items = [("source", source)]
+    if backend != "all":
+        items.append(("backend", backend))
+    if include_subscription:
+        items.append(("include_subscription", "1"))
+    return urlencode(items)
 
 
 def _model_composition(rows: list[Any]) -> dict[str, Any]:
@@ -104,6 +139,7 @@ def _model_composition(rows: list[Any]) -> dict[str, Any]:
 
 
 def _sort_links(request: Request, current_sort: str, current_direction: str) -> dict[str, str]:
+    # Every other query parameter (source, backend, filters) is preserved.
     base = [
         (key, value) for key, value in request.query_params.multi_items()
         if key not in {"sort", "direction"}
@@ -133,19 +169,19 @@ def _period_boundary(period: str, now: datetime | None = None) -> str | None:
     return start.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
-def _period_clause(period: str, source: str = "all") -> tuple[str, tuple[Any, ...]]:
+def _period_clause(period: str, source: str = "all", backend: str = "all") -> tuple[str, tuple[Any, ...]]:
     boundary = _period_boundary(period)
     clauses, params = [], []
     if boundary is not None:
         clauses.append("julianday(u.timestamp)>=julianday(?)")
         params.append(boundary)
-    source_clause, source_params = _source_usage_clause(source)
+    source_clause, source_params = _source_usage_clause(source, backend)
     clauses.append(source_clause)
     params.extend(source_params)
     return " AND ".join(clauses), tuple(params)
 
 
-def _session_period(period: str, source: str = "all") -> tuple[str, tuple[Any, ...]]:
+def _session_period(period: str, source: str = "all", backend: str = "all") -> tuple[str, tuple[Any, ...]]:
     boundary = _period_boundary(period)
     usage = "EXISTS(SELECT 1 FROM usage up WHERE up.session_id=s.id"
     params: list[Any] = []
@@ -156,39 +192,52 @@ def _session_period(period: str, source: str = "all") -> tuple[str, tuple[Any, .
     if source != "all":
         usage += " AND s.source_app=?"
         params.append(source)
+    backend_clause, backend_params = _backend_session_clause(backend)
+    if backend_params:
+        usage += f" AND {backend_clause}"
+        params.extend(backend_params)
     return usage, tuple(params)
 
 
 def _overview(
-    conn, period: str, sort: str = "started", direction: str = "desc", source: str = "all"
+    conn, period: str, sort: str = "started", direction: str = "desc", source: str = "all",
+    backend: str = "all", include_subscription: bool = False,
 ) -> dict[str, Any]:
-    usage_where, usage_params = _period_clause(period, source)
+    usage_where, usage_params = _period_clause(period, source, backend)
+    cost, unknown = cost_sql(include_subscription)
     usage = conn.execute(
         f"""SELECT COALESCE(SUM(total_tokens),0) tokens,COALESCE(SUM(input_tokens),0) input_tokens,
-            COALESCE(SUM(cached_input_tokens),0) cached_tokens,SUM(CAST(cost_usd AS REAL)) known_cost,
-            SUM(cost_usd IS NULL) unknown_cost_records,COUNT(DISTINCT session_id) sessions,
-            COUNT(DISTINCT thread_id) agents FROM usage u WHERE {usage_where}""",
+            COALESCE(SUM(cached_input_tokens),0) cached_tokens,SUM({cost}) known_cost,
+            SUM({unknown}) unknown_cost_records,COUNT(DISTINCT session_id) sessions,
+            COUNT(DISTINCT thread_id) agents,
+            SUM(CAST(u.equivalent_cost_usd AS REAL)) subscription_value,
+            SUM(u.billing_mode='subscription' AND u.equivalent_cost_usd IS NULL) unknown_value_records
+            FROM usage u WHERE {usage_where}""",
         usage_params,
     ).fetchone()
-    session_where, session_params = _session_period(period, source)
+    session_where, session_params = _session_period(period, source, backend)
     rows = session_rows(
-        conn, where=session_where, params=session_params, order=sort, direction=direction
+        conn, where=session_where, params=session_params, order=sort, direction=direction,
+        include_subscription=include_subscription,
     )
-    incomplete_sessions = sum(1 for row in rows if row["accounting_status"] != "complete")
+    incomplete_sessions = sum(
+        1 for row in rows if row["accounting_status"] not in ("complete", "estimated")
+    )
     known_session_costs = [
         float(r[0] or 0) for r in conn.execute(
-            f"""SELECT SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where}
-                GROUP BY session_id HAVING SUM(cost_usd IS NULL)=0""",
+            f"""SELECT SUM({cost}) FROM usage u WHERE {usage_where}
+                GROUP BY session_id HAVING SUM({unknown})=0""",
             usage_params,
         ).fetchall()
     ]
     subagents = sum(max(0, int(r["agent_count"]) - 1) for r in rows)
     models = conn.execute(
-        f"""SELECT model,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
+        f"""SELECT model,GROUP_CONCAT(DISTINCT backend) backends,
+            COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
             SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
             SUM(output_tokens) output_tokens,SUM(total_tokens) total_tokens,
             SUM(source_event_type!='claude_cost_state') usage_events,
-            SUM(CAST(cost_usd AS REAL)) cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
+            SUM({cost}) cost_usd,SUM({unknown}) unknown_cost_records
             FROM usage u WHERE {usage_where} GROUP BY model ORDER BY cost_usd DESC""",
         usage_params,
     ).fetchall()
@@ -199,6 +248,8 @@ def _overview(
         "tokens": usage["tokens"], "input_tokens": usage["input_tokens"],
         "cached_tokens": usage["cached_tokens"], "known_cost": total_known,
         "unknown_cost_records": (usage["unknown_cost_records"] or 0) + incomplete_sessions,
+        "subscription_value": float(usage["subscription_value"] or 0),
+        "unknown_value_records": int(usage["unknown_value_records"] or 0),
         "sessions": len(rows), "agents": usage["agents"], "subagents": subagents,
         "average": statistics.fmean(known_session_costs) if known_session_costs else 0,
         "median": statistics.median(known_session_costs) if known_session_costs else 0,
@@ -273,37 +324,54 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
 
     def render(request: Request, name: str, **context):
         source = _source(context.pop("source", "all"))
+        backend = _backend(context.pop("backend", "all"))
+        include_subscription = bool(context.pop("include_subscription", False))
         source_links = {
             item: str(request.url.include_query_params(source=item)) for item in SOURCES
         }
+        backend_links = {
+            item: str(request.url.include_query_params(backend=item)) for item in BACKEND_FILTERS
+        }
+        subscription_toggle_link = str(
+            request.url.include_query_params(include_subscription="0" if include_subscription else "1")
+        )
         return templates.TemplateResponse(
             request=request,
             name=name,
             context={
                 "request": request, "source": source, "sources": SOURCES,
-                "source_links": source_links, "source_labels": SOURCE_LABELS, **context,
+                "source_links": source_links, "source_labels": SOURCE_LABELS,
+                "backend": backend, "backends": BACKEND_FILTERS, "backend_links": backend_links,
+                "backend_labels": BACKEND_FILTER_LABELS,
+                "include_subscription": include_subscription,
+                "subscription_toggle_link": subscription_toggle_link,
+                "nav_query": _query_suffix(source, backend, include_subscription),
+                **context,
             },
         )
 
     @app.get("/", response_class=HTMLResponse)
     def home(
         request: Request, period: str = "30d", sort: str = "started", direction: str = "desc",
-        source: str = "all",
+        source: str = "all", backend: str = "all", include_subscription: bool = False,
     ):
         source = _source(source)
+        backend = _backend(backend)
         sort = sort if sort in SESSION_SORT_KEYS else "started"
         direction = "asc" if direction == "asc" else "desc"
+        cost, _unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
-            overview = _overview(conn, period, sort, direction, source)
-            usage_where, usage_params = _period_clause(period, source)
+            overview = _overview(conn, period, sort, direction, source, backend, include_subscription)
+            usage_where, usage_params = _period_clause(period, source, backend)
             daily = conn.execute(
-                f"SELECT date(timestamp,'localtime'),SUM(CAST(cost_usd AS REAL)) FROM usage u WHERE {usage_where} "
+                f"SELECT date(timestamp,'localtime'),SUM({cost}) FROM usage u WHERE {usage_where} "
                 "GROUP BY date(timestamp,'localtime') HAVING date(timestamp,'localtime') IS NOT NULL "
                 "ORDER BY date(timestamp,'localtime')",
                 usage_params,
             ).fetchall()
         return render(
-            request, "home.html", active="home", source=source, period=period, data=overview,
+            request, "home.html", active="home", source=source, backend=backend,
+            include_subscription=include_subscription, period=period, data=overview,
             trend=_svg_trend(daily), refresh=10, sort_key=sort, sort_direction=direction,
             sort_links=_sort_links(request, sort, direction),
         )
@@ -314,15 +382,21 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         start: str | None = None, end: str | None = None,
         project: str | None = None, model: str | None = None, root_model: str | None = None,
         contains_astra: bool = False, subagents: bool = False, min_cost: float | None = None,
-        source: str = "all",
+        source: str = "all", backend: str = "all", include_subscription: bool = False,
     ):
         source = _source(source)
+        backend = _backend(backend)
         sort = sort if sort in SESSION_SORT_KEYS else "started"
         direction = "asc" if direction == "asc" else "desc"
+        cost, _unknown = cost_sql(include_subscription, alias="uf")
         clauses, params = ["1=1"], []
         if source != "all":
             clauses.append("s.source_app=?")
             params.append(source)
+        backend_clause, backend_params = _backend_session_clause(backend)
+        if backend_params:
+            clauses.append(backend_clause)
+            params.extend(backend_params)
         if start:
             clauses.append("date(s.created_at,'localtime')>=date(?)")
             params.append(start)
@@ -345,19 +419,19 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 "EXISTS(SELECT 1 FROM agents af WHERE af.session_id=s.id AND af.parent_thread_id IS NOT NULL)"
             )
         if min_cost is not None:
-            clauses.append("COALESCE((SELECT SUM(CAST(cost_usd AS REAL)) FROM usage uf WHERE uf.session_id=s.id),0)>=?")
+            clauses.append(f"COALESCE((SELECT SUM({cost}) FROM usage uf WHERE uf.session_id=s.id),0)>=?")
             params.append(min_cost)
         with database(settings.database, readonly=True) as conn:
             rows = session_rows(
                 conn, where=" AND ".join(clauses), params=tuple(params), order=sort,
-                direction=direction,
+                direction=direction, include_subscription=include_subscription,
             )
             source_sql, source_values = (("", ()) if source == "all" else (" AND source_app=?", (source,)))
             projects = [r[0] for r in conn.execute(
                 "SELECT DISTINCT COALESCE(repo_name,cwd) FROM sessions "
                 f"WHERE COALESCE(repo_name,cwd) IS NOT NULL{source_sql} ORDER BY 1", source_values
             )]
-            usage_source, usage_values = _source_usage_clause(source)
+            usage_source, usage_values = _source_usage_clause(source, backend)
             models = [r[0] for r in conn.execute(
                 f"SELECT DISTINCT model FROM usage u WHERE {usage_source} ORDER BY model", usage_values
             )]
@@ -366,25 +440,29 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 f"{source_sql} ORDER BY root_model", source_values
             )]
         return render(
-            request, "sessions.html", active="sessions", source=source, rows=rows, projects=projects,
+            request, "sessions.html", active="sessions", source=source, backend=backend,
+            include_subscription=include_subscription, rows=rows, projects=projects,
             models=models, roots=roots, sort_key=sort, sort_direction=direction,
             sort_links=_sort_links(request, sort, direction), sort_labels=SESSION_SORT_LABELS,
         )
 
     @app.get("/sessions/{session_id}", response_class=HTMLResponse)
-    def session_page(request: Request, session_id: str):
+    def session_page(
+        request: Request, session_id: str, backend: str = "all", include_subscription: bool = False,
+    ):
+        cost, unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
-            session = session_detail(conn, session_id)
+            session = session_detail(conn, session_id, include_subscription=include_subscription)
             agents = conn.execute(
-                """SELECT a.*,
+                f"""SELECT a.*,
                    COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
                    COALESCE(SUM(u.input_tokens),0) input_tokens,
                    COALESCE(SUM(u.cached_input_tokens),0) cached_input_tokens,
                    COALESCE(SUM(u.output_tokens),0) output_tokens,
                    COALESCE(SUM(u.reasoning_output_tokens),0) reasoning_tokens,
                    COALESCE(SUM(u.total_tokens),0) total_tokens,
-                   SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,
-                   SUM(u.id IS NOT NULL AND u.cost_usd IS NULL) unknown_cost_records,
+                   SUM({cost}) known_cost_usd,
+                   SUM(u.id IS NOT NULL AND {unknown}) unknown_cost_records,
                    CAST(strftime('%s',COALESCE(MAX(u.timestamp),a.updated_at))
                         -strftime('%s',COALESCE(MIN(u.timestamp),a.created_at)) AS INTEGER) duration_seconds,
                    GROUP_CONCAT(DISTINCT u.model) models_used
@@ -393,12 +471,12 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                 (session_id,),
             ).fetchall()
             model_rows = conn.execute(
-                """SELECT model,COUNT(DISTINCT thread_id) agents,
+                f"""SELECT model,GROUP_CONCAT(DISTINCT backend) backends,COUNT(DISTINCT thread_id) agents,
                    SUM(source_event_type!='claude_cost_state') usage_events,SUM(input_tokens) input_tokens,
                    SUM(cached_input_tokens) cached_input_tokens,SUM(output_tokens) output_tokens,
                    SUM(reasoning_output_tokens) reasoning_tokens,SUM(total_tokens) total_tokens,
-                   SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records
-                   FROM usage WHERE session_id=? GROUP BY model ORDER BY known_cost_usd DESC""",
+                   SUM({cost}) known_cost_usd,SUM({unknown}) unknown_cost_records
+                   FROM usage u WHERE session_id=? GROUP BY model ORDER BY known_cost_usd DESC""",
                 (session_id,),
             ).fetchall()
             event_rows = conn.execute(
@@ -425,14 +503,18 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             data["full_identity"] = data.get("response_id") or data["source_record_identity"]
             events.append(data)
         return render(
-            request, "session.html", active="sessions", source=session["source_app"], session=session,
+            request, "session.html", active="sessions", source=session["source_app"],
+            backend=backend, include_subscription=include_subscription, session=session,
             agents=agent_rows,
             models=model_rows, model_composition=_model_composition(model_rows), events=events,
             tags=tags, refresh=10 if session["status"] == "running" else None,
         )
 
     @app.post("/sessions/{session_id}/tags")
-    def update_tags(session_id: str, tags: str = Form(""), source: str = "all"):
+    def update_tags(
+        session_id: str, tags: str = Form(""), source: str = "all", backend: str = "all",
+        include_subscription: bool = False,
+    ):
         names = sorted({part.strip() for part in tags.split(",") if part.strip()})
         with database(settings.database) as conn:
             if not conn.execute("SELECT 1 FROM sessions WHERE id=?", (session_id,)).fetchone():
@@ -441,45 +523,62 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             for name in names:
                 conn.execute("INSERT OR IGNORE INTO tags(name) VALUES(?)", (name,))
                 conn.execute("INSERT INTO session_tags SELECT ?,id FROM tags WHERE name=?", (session_id, name))
-        return RedirectResponse(f"/sessions/{session_id}?source={_source(source)}", status_code=303)
+        query = _query_suffix(_source(source), _backend(backend), include_subscription)
+        return RedirectResponse(f"/sessions/{session_id}?{query}", status_code=303)
 
     @app.get("/models", response_class=HTMLResponse)
-    def models_page(request: Request, source: str = "all"):
+    def models_page(
+        request: Request, source: str = "all", backend: str = "all", include_subscription: bool = False,
+    ):
         source = _source(source)
-        source_where, source_params = _source_usage_clause(source)
+        backend = _backend(backend)
+        source_where, source_params = _source_usage_clause(source, backend)
+        cost, unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
-                f"""SELECT model,provider,COUNT(DISTINCT session_id) sessions,COUNT(DISTINCT thread_id) agents,
+                f"""SELECT model,provider,backend,COUNT(DISTINCT session_id) sessions,
+                   COUNT(DISTINCT thread_id) agents,
                    SUM(source_event_type!='claude_cost_state') usage_events,
                    SUM(total_tokens) total_tokens,SUM(input_tokens) input_tokens,
                    SUM(cached_input_tokens) cached_input_tokens,
-                   SUM(CAST(cost_usd AS REAL)) known_cost_usd,SUM(cost_usd IS NULL) unknown_cost_records,
-                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
-                   FROM usage u WHERE {source_where} GROUP BY model,provider ORDER BY known_cost_usd DESC""",
+                   SUM({cost}) known_cost_usd,SUM({unknown}) unknown_cost_records,
+                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
+                   FROM usage u WHERE {source_where} GROUP BY model,provider,backend
+                   ORDER BY known_cost_usd DESC""",
                 source_params,
             ).fetchall()
             daily = conn.execute(
-                f"""SELECT date(timestamp,'localtime'),model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
+                f"""SELECT date(timestamp,'localtime'),model,SUM({cost}),SUM({unknown})
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
                    HAVING date(timestamp,'localtime') IS NOT NULL ORDER BY 1,2""",
                 source_params,
             ).fetchall()
         return render(
-            request, "models.html", active="models", source=source, rows=rows, daily=daily,
+            request, "models.html", active="models", source=source, backend=backend,
+            include_subscription=include_subscription, rows=rows, daily=daily,
             model_composition=_model_composition(rows),
         )
 
     @app.get("/projects", response_class=HTMLResponse)
-    def projects_page(request: Request, source: str = "all"):
+    def projects_page(
+        request: Request, source: str = "all", backend: str = "all", include_subscription: bool = False,
+    ):
         source = _source(source)
+        backend = _backend(backend)
         source_where = "1=1" if source == "all" else "s.source_app=?"
-        source_params = () if source == "all" else (source,)
+        source_params: tuple[Any, ...] = () if source == "all" else (source,)
+        # Rows are joined per usage record, so the backend filter applies to
+        # the record rather than to the whole session.
+        if backend != "all":
+            source_where += " AND u.backend=?"
+            source_params = (*source_params, backend)
+        cost, unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
             rows = conn.execute(
                 f"""SELECT COALESCE(s.repo_name,s.cwd,'unknown') project,COUNT(DISTINCT s.id) sessions,
-                   SUM(u.total_tokens) total_tokens,SUM(CAST(u.cost_usd AS REAL)) known_cost_usd,
-                   SUM(u.cost_usd IS NULL) unknown_cost_records,
-                   SUM(CAST(u.cost_usd AS REAL))/COUNT(DISTINCT s.id) average_cost,
+                   SUM(u.total_tokens) total_tokens,SUM({cost}) known_cost_usd,
+                   SUM(u.id IS NOT NULL AND {unknown}) unknown_cost_records,
+                   SUM({cost})/COUNT(DISTINCT s.id) average_cost,
                    COUNT(DISTINCT u.thread_id) agents,
                    COALESCE(SUM(u.id IS NOT NULL AND u.source_event_type!='claude_cost_state'),0) usage_events,
                    100.0*SUM(u.cached_input_tokens)/NULLIF(SUM(u.input_tokens),0) cached_pct
@@ -487,49 +586,64 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
                    GROUP BY project ORDER BY known_cost_usd DESC""",
                 source_params,
             ).fetchall()
-        return render(request, "projects.html", active="projects", source=source, rows=rows)
+        return render(
+            request, "projects.html", active="projects", source=source, backend=backend,
+            include_subscription=include_subscription, rows=rows,
+        )
 
     @app.get("/trends", response_class=HTMLResponse)
-    def trends_page(request: Request, source: str = "all"):
+    def trends_page(
+        request: Request, source: str = "all", backend: str = "all", include_subscription: bool = False,
+    ):
         source = _source(source)
-        source_where, source_params = _source_usage_clause(source)
+        backend = _backend(backend)
+        source_where, source_params = _source_usage_clause(source, backend)
+        cost, unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
             daily = conn.execute(
-                f"""SELECT date(timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                f"""SELECT date(timestamp,'localtime') period,SUM({cost}) cost,
                    SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
-                   SUM(cost_usd IS NULL) unknown_cost_records,
+                   SUM({unknown}) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
-                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
+                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime')
                    HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             weekly = conn.execute(
-                f"""SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM(CAST(cost_usd AS REAL)) cost,
+                f"""SELECT strftime('%Y-W%W',timestamp,'localtime') period,SUM({cost}) cost,
                    SUM(total_tokens) tokens,COUNT(DISTINCT session_id) sessions,
-                   SUM(cost_usd IS NULL) unknown_cost_records,
+                   SUM({unknown}) unknown_cost_records,
                    100.0*SUM(cached_input_tokens)/NULLIF(SUM(input_tokens),0) cached_pct,
-                   SUM(CAST(cost_usd AS REAL))/COUNT(DISTINCT session_id) average_cost
+                   SUM({cost})/COUNT(DISTINCT session_id) average_cost
                    FROM usage u WHERE {source_where} GROUP BY strftime('%Y-W%W',timestamp,'localtime')
                    HAVING period IS NOT NULL ORDER BY period""",
                 source_params,
             ).fetchall()
             by_model = conn.execute(
-                f"""SELECT date(timestamp,'localtime') period,model,SUM(CAST(cost_usd AS REAL)) cost,
-                   SUM(total_tokens) tokens,SUM(cost_usd IS NULL) unknown_cost_records
+                f"""SELECT date(timestamp,'localtime') period,model,SUM({cost}) cost,
+                   SUM(total_tokens) tokens,SUM({unknown}) unknown_cost_records
                    FROM usage u WHERE {source_where} GROUP BY date(timestamp,'localtime'),model
                    HAVING period IS NOT NULL ORDER BY period,model""",
                 source_params,
             ).fetchall()
-        return render(request, "trends.html", active="trends", source=source, daily=daily, weekly=weekly,
-                      by_model=by_model, spend_svg=_svg_trend(daily))
+        return render(
+            request, "trends.html", active="trends", source=source, backend=backend,
+            include_subscription=include_subscription, daily=daily, weekly=weekly,
+            by_model=by_model, spend_svg=_svg_trend(daily),
+        )
 
     @app.get("/compare", response_class=HTMLResponse)
-    def compare_page(request: Request, session: list[str] = Query(default=[]), source: str = "all"):
+    def compare_page(
+        request: Request, session: list[str] = Query(default=[]), source: str = "all",
+        backend: str = "all", include_subscription: bool = False,
+    ):
         source = _source(source)
+        backend = _backend(backend)
         selected = session[:4]
+        cost, unknown = cost_sql(include_subscription)
         with database(settings.database, readonly=True) as conn:
-            rows = [session_detail(conn, sid) for sid in selected]
+            rows = [session_detail(conn, sid, include_subscription=include_subscription) for sid in selected]
             rows = [
                 row for row in rows
                 if row is not None and (source == "all" or row["source_app"] == source)
@@ -537,13 +651,14 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             selected = [row["id"] for row in rows]
             model_costs = {
                 sid: {r[0]: (r[1], r[2]) for r in conn.execute(
-                    """SELECT model,SUM(CAST(cost_usd AS REAL)),SUM(cost_usd IS NULL)
-                       FROM usage WHERE session_id=? GROUP BY model""", (sid,)
+                    f"""SELECT model,SUM({cost}),SUM({unknown})
+                       FROM usage u WHERE session_id=? GROUP BY model""", (sid,)
                 )} for sid in selected
             }
             compared_models = sorted({model for costs in model_costs.values() for model in costs})
         return render(
-            request, "compare.html", active="compare", source=source, rows=rows,
+            request, "compare.html", active="compare", source=source, backend=backend,
+            include_subscription=include_subscription, rows=rows,
             model_costs=model_costs, compared_models=compared_models,
         )
 

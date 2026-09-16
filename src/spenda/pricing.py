@@ -78,7 +78,60 @@ BUILTIN_PRICES = (
     },
 )
 
-BUILTIN_ALIASES = {"gpt-5.6": "gpt-5.6-sol"}
+ANTHROPIC_PRICE_SOURCE = "https://platform.claude.com/docs/en/about-claude/pricing"
+# Anthropic list prices apply to Vertex AI and Bedrock as well, so Claude Code
+# rows on every backend are estimated from provider ``anthropic``.  The
+# effective start is a local-history coverage floor, not a launch date.  Cache
+# writes are the 5-minute rate (1.25x input); 1-hour writes (2x input) are
+# uplifted per record from the transcript's cache_creation split.  1M-context
+# models bill the full window at standard rates, so no long-context threshold.
+_ANTHROPIC_NOTE = (
+    "Anthropic list price captured 2026-09-15; Vertex AI and Bedrock reuse it. Cache write is "
+    "the 5m rate, 1h writes are uplifted at ingest; fast mode and server tools are not modeled."
+)
+_ANTHROPIC_FROM = "2025-09-01T00:00:00Z"
+BUILTIN_PRICES += tuple(
+    {
+        "model": model, "provider": "anthropic", "effective_from": _ANTHROPIC_FROM,
+        "input": rates[0], "cached": rates[1], "write": rates[2], "output": rates[3],
+        "threshold": None, "long_in": "1", "long_out": "1",
+        "source": ANTHROPIC_PRICE_SOURCE, "notes": _ANTHROPIC_NOTE,
+    }
+    for model, rates in (
+        ("claude-fable-5-1", ("10", "0.25", "12.5", "50")),
+        ("claude-fable-5", ("10", "1", "12.5", "50")),
+        ("claude-opus-5", ("5", "0.5", "6.25", "25")),
+        ("claude-opus-4-8", ("5", "0.5", "6.25", "25")),
+        ("claude-opus-4-7", ("5", "0.5", "6.25", "25")),
+        ("claude-opus-4-6", ("5", "0.5", "6.25", "25")),
+        ("claude-opus-4-5", ("5", "0.5", "6.25", "25")),
+        ("claude-sonnet-5", ("2", "0.2", "2.5", "10")),
+        ("claude-sonnet-4-6", ("3", "0.3", "3.75", "15")),
+        ("claude-sonnet-4-5", ("3", "0.3", "3.75", "15")),
+        ("claude-haiku-4-5", ("1", "0.1", "1.25", "5")),
+    )
+)
+
+# (alias, canonical model, provider). Aliases stay explicit: dated snapshot ids
+# and Vertex "@date" spellings are the same price as the bare model id.
+BUILTIN_ALIASES = (
+    ("gpt-5.6", "gpt-5.6-sol", "openai"),
+    ("claude-opus-4-5-20251101", "claude-opus-4-5", "anthropic"),
+    ("claude-opus-4-5@20251101", "claude-opus-4-5", "anthropic"),
+    ("claude-sonnet-4-5-20250929", "claude-sonnet-4-5", "anthropic"),
+    ("claude-sonnet-4-5@20250929", "claude-sonnet-4-5", "anthropic"),
+    ("claude-haiku-4-5-20251001", "claude-haiku-4-5", "anthropic"),
+    ("claude-haiku-4-5@20251001", "claude-haiku-4-5", "anthropic"),
+)
+
+# Claude Code labels 1M-context requests with a "[1m]" suffix; the price is the
+# model's standard rate across the full window.
+_CONTEXT_SUFFIX = "[1m]"
+
+
+def price_model(model: str) -> str:
+    """Return the model id used for price lookup (only strips the [1m] suffix)."""
+    return model[: -len(_CONTEXT_SUFFIX)] if model.endswith(_CONTEXT_SUFFIX) else model
 
 
 def seed_prices(conn: sqlite3.Connection) -> None:
@@ -88,17 +141,17 @@ def seed_prices(conn: sqlite3.Connection) -> None:
                 model,provider,effective_from,input_per_million,
                 cached_input_per_million,cache_write_per_million,output_per_million,
                 long_context_threshold,long_input_multiplier,long_output_multiplier,source,notes
-            ) VALUES(?, 'openai', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                row["model"], row["effective_from"], row["input"], row["cached"],
-                row["write"], row["output"], row["threshold"], row["long_in"],
+                row["model"], row.get("provider", "openai"), row["effective_from"], row["input"],
+                row["cached"], row["write"], row["output"], row["threshold"], row["long_in"],
                 row["long_out"], row["source"], row["notes"],
             ),
         )
-    for alias, canonical in BUILTIN_ALIASES.items():
+    for alias, canonical, provider in BUILTIN_ALIASES:
         conn.execute(
-            "INSERT OR IGNORE INTO model_aliases(alias,canonical_model,provider) VALUES(?,?,'openai')",
-            (alias, canonical),
+            "INSERT OR IGNORE INTO model_aliases(alias,canonical_model,provider) VALUES(?,?,?)",
+            (alias, canonical, provider),
         )
 
 
@@ -154,6 +207,34 @@ def calculate_cost(
     return CostResult(price["id"], uncached, cached, write, output, total, note)
 
 
+def estimate_cost(
+    conn: sqlite3.Connection,
+    usage: TokenUsage,
+    model: str,
+    provider: str,
+    timestamp: str,
+    *,
+    cache_write_1h_tokens: int = 0,
+) -> CostResult:
+    """Price a record from list prices, uplifting 1-hour cache writes to 2x input.
+
+    The price table stores the 5-minute cache-write rate (1.25x input); the
+    1-hour subset costs 2x input, so the difference (0.75x input) is added for
+    those tokens.
+    """
+    cost = calculate_cost(conn, usage, price_model(model), provider, timestamp)
+    if cost.price_id is None or cache_write_1h_tokens <= 0:
+        return cost
+    price = conn.execute("SELECT input_per_million FROM prices WHERE id=?", (cost.price_id,)).fetchone()
+    uplift = Decimal(cache_write_1h_tokens) * Decimal(price[0]) * Decimal("0.75") / MILLION
+    note = f"1h cache-write uplift applied to {cache_write_1h_tokens} tokens"
+    return CostResult(
+        cost.price_id, cost.uncached_input_usd, cost.cached_input_usd,
+        cost.cache_write_usd + uplift, cost.output_usd, cost.total_usd + uplift,
+        f"{cost.note}; {note}" if cost.note else note,
+    )
+
+
 def add_price(
     conn: sqlite3.Connection,
     *,
@@ -181,10 +262,17 @@ def reprice_usage(
     conn: sqlite3.Connection, *, model: str | None = None, provider: str | None = None
 ) -> int:
     """Recalculate stored audit rows after an effective-dated price change."""
-    # OpenCode and Claude Code already provide source-owned accounting.  Never
-    # overwrite their direct costs (or Claude's zero-cost call rows that are
-    # represented by a separate cumulative cost-state record) with API prices.
-    clauses, params = ["source_event_type NOT GLOB 'opencode_*'", "source_event_type NOT GLOB 'claude_*'"], []
+    # OpenCode and Claude Code cost-state rows carry source-owned accounting and
+    # are never repriced.  Claude call rows are repriced only when they were
+    # estimated from list prices (or still unpriced); rows whose dollars are
+    # represented by a cumulative cost-state record keep their zero cost.
+    clauses, params = [
+        "source_event_type NOT GLOB 'opencode_*'",
+        "source_event_type!='claude_cost_state'",
+        "(source_event_type!='claude_assistant_message' OR price_id IS NOT NULL"
+        " OR (billing_mode='subscription' AND equivalent_cost_usd IS NULL)"
+        " OR (billing_mode!='subscription' AND cost_usd IS NULL))",
+    ], []
     if model is not None:
         clauses.append("model=?")
         params.append(model)
@@ -203,20 +291,35 @@ def reprice_usage(
             reasoning_output_tokens=row["reasoning_output_tokens"],
             total_tokens=row["total_tokens"],
         )
-        cost = calculate_cost(conn, usage, row["model"], row["provider"], row["timestamp"])
+        cost = estimate_cost(
+            conn, usage, row["model"], row["provider"], row["timestamp"],
+            cache_write_1h_tokens=int(row["cache_write_1h_input_tokens"] or 0),
+        )
         conn.execute(
             """UPDATE usage SET price_id=?,uncached_input_usd=?,cached_input_usd=?,
-               cache_write_usd=?,output_usd=?,cost_usd=?,pricing_note=? WHERE id=?""",
+               cache_write_usd=?,output_usd=?,cost_usd=?,equivalent_cost_usd=?,pricing_note=? WHERE id=?""",
             (
                 cost.price_id,
-                str(cost.uncached_input_usd) if cost.uncached_input_usd is not None else None,
-                str(cost.cached_input_usd) if cost.cached_input_usd is not None else None,
-                str(cost.cache_write_usd) if cost.cache_write_usd is not None else None,
-                str(cost.output_usd) if cost.output_usd is not None else None,
-                str(cost.total_usd) if cost.total_usd is not None else None,
+                *(
+                    str(value) if value is not None else None
+                    for value in (cost.uncached_input_usd, cost.cached_input_usd, cost.cache_write_usd, cost.output_usd)
+                ),
+                *subscription_split(
+                    str(cost.total_usd) if cost.total_usd is not None else None,
+                    row["billing_mode"] == "subscription",
+                ),
                 cost.note,
                 row["id"],
             ),
         )
         updated += 1
     return updated
+
+
+def subscription_split(total: str | None, subscription: bool) -> tuple[str | None, str | None]:
+    """Return ``(cost_usd, equivalent_cost_usd)`` for a priced total.
+
+    Subscription usage has no metered charge, so its real cost is zero and the
+    list-price value is kept separately as an equivalent API value.
+    """
+    return ("0", total) if subscription else (total, None)
