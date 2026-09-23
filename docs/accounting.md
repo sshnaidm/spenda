@@ -115,3 +115,17 @@ OpenCode assistant messages already contain token categories and a client-calcul
 ## 11. Claude Code accounting
 
 Claude Code transcript usage records contain model and token categories. The importer deduplicates streaming updates by `(sessionId, message.id)` and keeps the latest record. Claude's `output_tokens` already includes thinking tokens; `thinking_tokens` is retained as a reasoning subset and is not added again. Claude `cost-state` records are cumulative, so consecutive snapshots are converted into dated cost changes whose sum equals the latest source total. This preserves historical period reporting without allocating cost to individual messages. Older or uncovered sessions remain unpriced. Subscription-backed figures are informational rather than an API invoice.
+
+## 12. Cursor accounting
+
+Cursor bills by subscription and request, and its local history stores no
+cost. Transcripts record no token counts either; editor bubbles carry a
+`tokenCount` that Cursor populates only in some releases. The importer stores
+one usage row per assistant message with the bubble-derived input and output
+tokens when they can be aligned, and zero tokens otherwise. Rows with tokens
+are priced from the price table for provider `cursor` (add rows with
+`spenda price-add --provider cursor`); rows without tokens have no cost, and a
+session with any such row is marked `partial` with the note "Cursor keeps no
+token or cost accounting in its local history". Per-call timestamps come from editor
+bubbles; without them every call of a session is dated at the session start.
+See [data-sources.md](data-sources.md) for the exact read-only boundary.

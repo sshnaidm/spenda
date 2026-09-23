@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from ..config import Settings
 from .claude import ClaudeIngestSummary, discover_claude_home, ingest_claude
+from .cursor import CursorIngestSummary, cursor_sources_present, ingest_cursor
 from .opencode import OpenCodeIngestSummary, ingest_opencode
 from .scanner import IngestSummary
 from .scanner import ingest as ingest_codex
@@ -27,6 +28,7 @@ class CombinedIngestSummary:
     codex: IngestSummary | None = None
     opencode: OpenCodeIngestSummary | None = None
     claude: ClaudeIngestSummary | None = None
+    cursor: CursorIngestSummary | None = None
     source_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -53,7 +55,11 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
     if discover_claude_home(settings).is_dir():
         claude = attempt("claude", lambda: ingest_claude(settings, force_all=force_all))
 
-    summaries = [item for item in (codex, opencode, claude) if item is not None]
+    cursor = None
+    if cursor_sources_present(settings):
+        cursor = attempt("cursor", lambda: ingest_cursor(settings, force_all=force_all))
+
+    summaries = [item for item in (codex, opencode, claude, cursor) if item is not None]
     return CombinedIngestSummary(
         scanned_files=sum(item.scanned_files for item in summaries),
         root_sessions=sum(item.root_sessions for item in summaries),
@@ -68,5 +74,6 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
         codex=codex,
         opencode=opencode,
         claude=claude,
+        cursor=cursor,
         source_errors=errors,
     )

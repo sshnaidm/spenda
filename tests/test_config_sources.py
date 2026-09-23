@@ -80,3 +80,36 @@ def test_dashboard_database_cannot_be_inside_claude_home(tmp_path):
 
     with pytest.raises(ValueError, match="CLAUDE_CONFIG_DIR"):
         settings.validate()
+
+
+def test_cursor_paths_use_environment_overrides(monkeypatch, tmp_path):
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "cursor"))
+    monkeypatch.setenv("CURSOR_USER_DIR", str(tmp_path / "cursor-user"))
+
+    settings = Settings.load(tmp_path / "codex", tmp_path / "dashboard.sqlite")
+
+    assert settings.cursor_home == (tmp_path / "cursor").resolve()
+    assert settings.cursor_user_dir == (tmp_path / "cursor-user").resolve()
+
+
+def test_cursor_user_dir_defaults_to_platform_location(monkeypatch, tmp_path):
+    monkeypatch.delenv("CURSOR_USER_DIR", raising=False)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setattr("spenda.config.sys.platform", "linux")
+    monkeypatch.setattr("spenda.config.os.name", "posix")
+
+    settings = Settings.load(tmp_path / "codex", tmp_path / "dashboard.sqlite")
+
+    assert settings.cursor_user_dir == (tmp_path / "config" / "Cursor" / "User").resolve()
+
+
+def test_dashboard_database_cannot_be_inside_cursor_directories(tmp_path):
+    cursor_home = tmp_path / "cursor"
+    settings = Settings(tmp_path / "codex", cursor_home / "dashboard.sqlite", cursor_home=cursor_home)
+    with pytest.raises(ValueError, match="CURSOR_HOME"):
+        settings.validate()
+
+    user_dir = tmp_path / "cursor-user"
+    settings = Settings(tmp_path / "codex", user_dir / "dashboard.sqlite", cursor_user_dir=user_dir)
+    with pytest.raises(ValueError, match="CURSOR_USER_DIR"):
+        settings.validate()

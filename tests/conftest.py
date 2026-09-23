@@ -9,6 +9,14 @@ import pytest
 from spenda.config import Settings
 
 
+@pytest.fixture(autouse=True)
+def _isolated_cursor_history(tmp_path: Path, monkeypatch) -> None:
+    """Keep every test away from the developer's real Cursor history."""
+
+    monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "missing-cursor"))
+    monkeypatch.setenv("CURSOR_USER_DIR", str(tmp_path / "missing-cursor-user"))
+
+
 @pytest.fixture
 def dashboard_settings(tmp_path: Path) -> Settings:
     home = tmp_path / "codex"
@@ -17,6 +25,7 @@ def dashboard_settings(tmp_path: Path) -> Settings:
         home, tmp_path / "dashboard.sqlite", True, running_window_seconds=0,
         opencode_database=tmp_path / "missing-opencode.sqlite",
         claude_home=tmp_path / "missing-claude",
+        cursor_home=tmp_path / "missing-cursor", cursor_user_dir=tmp_path / "missing-cursor-user",
     )
 
 

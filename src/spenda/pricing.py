@@ -184,7 +184,12 @@ def reprice_usage(
     # OpenCode and Claude Code already provide source-owned accounting.  Never
     # overwrite their direct costs (or Claude's zero-cost call rows that are
     # represented by a separate cumulative cost-state record) with API prices.
-    clauses, params = ["source_event_type NOT GLOB 'opencode_*'", "source_event_type NOT GLOB 'claude_*'"], []
+    # Cursor rows without any token count are placeholders for responses the
+    # source never measured; pricing them would present unknown usage as free.
+    clauses, params = [
+        "source_event_type NOT GLOB 'opencode_*'", "source_event_type NOT GLOB 'claude_*'",
+        "NOT (source_event_type GLOB 'cursor_*' AND total_tokens=0)",
+    ], []
     if model is not None:
         clauses.append("model=?")
         params.append(model)

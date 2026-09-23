@@ -17,6 +17,7 @@ from .config import Settings
 from .db import database, initialize
 from .ingestion.claude import discover_claude_home
 from .ingestion.codex_state import read_state
+from .ingestion.cursor import cli_store_paths, discover_cursor_home, discover_cursor_user_dir, editor_state_path
 from .ingestion.opencode import discover_opencode_database
 from .ingestion.scanner import discover_rollouts
 from .ingestion.service import ingest_all as ingest
@@ -30,6 +31,11 @@ def _add_config(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--codex-home", help="Codex state directory (default: CODEX_HOME or ~/.codex)")
     parser.add_argument("--opencode-db", help="OpenCode SQLite database (default: OPENCODE_DB or XDG data path)")
     parser.add_argument("--claude-home", help="Claude Code directory (default: CLAUDE_CONFIG_DIR or ~/.claude)")
+    parser.add_argument("--cursor-home", help="Cursor agent history directory (default: CURSOR_HOME or ~/.cursor)")
+    parser.add_argument(
+        "--cursor-user-dir",
+        help="Cursor editor user-data directory (default: CURSOR_USER_DIR or the platform Cursor/User path)",
+    )
     parser.add_argument("--database", help="Dashboard-owned SQLite database")
     parser.add_argument("--no-preview", action="store_true", help="Do not persist first-message previews")
 
@@ -50,7 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.choices["sessions"]
     sessions.add_argument("--limit", type=int, default=30)
     sessions.add_argument("--sort", choices=("time", "cost", "tokens", "duration", "agents"), default="time")
-    sessions.add_argument("--source", choices=("all", "codex", "opencode", "claude"), default="all")
+    sessions.add_argument("--source", choices=("all", "codex", "opencode", "claude", "cursor"), default="all")
 
     ingest_p = sub.add_parser("ingest", help="Ingest new or changed coding-agent state")
     _add_config(ingest_p)
@@ -70,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(export)
     export.add_argument("--format", choices=("csv", "json"), required=True)
     export.add_argument("--breakdown", choices=("sessions", "models"), default="sessions")
-    export.add_argument("--source", choices=("all", "codex", "opencode", "claude"), default="all")
+    export.add_argument("--source", choices=("all", "codex", "opencode", "claude", "cursor"), default="all")
     export.add_argument("--output", "-o", default="-")
 
     rebuild = sub.add_parser("rebuild", help="Reimport derived data while preserving dashboard metadata")
@@ -102,6 +108,8 @@ def _settings(args: argparse.Namespace) -> Settings:
         args.codex_home, args.database, not args.no_preview,
         opencode_database=args.opencode_db,
         claude_home=args.claude_home,
+        cursor_home=args.cursor_home,
+        cursor_user_dir=args.cursor_user_dir,
     )
 
 
@@ -190,6 +198,32 @@ def doctor(settings: Settings) -> int:
         print(f"Claude Code transcripts: {transcripts}")
     else:
         print("Claude Code source: not found (skipped)")
+    cursor_home = discover_cursor_home(settings)
+    cursor_user_dir = discover_cursor_user_dir(settings)
+    print(f"Cursor home: {cursor_home}")
+    cursor_projects = cursor_home / "projects"
+    if cursor_projects.is_dir():
+        transcripts = sum(
+            1 for path in cursor_projects.rglob("*.jsonl") if "agent-transcripts" in path.parts
+        )
+        print(f"Cursor agent transcripts: {transcripts}")
+    else:
+        print("Cursor agent transcripts: not found (skipped)")
+    print(f"Cursor CLI chat stores: {len(cli_store_paths(cursor_home))}")
+    cursor_state = editor_state_path(cursor_user_dir)
+    if cursor_state.is_file():
+        print(f"Cursor editor state: {cursor_state}")
+        try:
+            with closing(sqlite3.connect(f"{cursor_state.as_uri()}?mode=ro", uri=True, timeout=0.2)) as source:
+                source.execute("PRAGMA query_only=ON")
+                composers = source.execute(
+                    "SELECT COUNT(*) FROM cursorDiskKV WHERE key>'composerData:' AND key<'composerData;'"
+                ).fetchone()[0]
+            print(f"Cursor editor composers: {composers}")
+        except sqlite3.DatabaseError as exc:
+            print(f"Cursor editor state warning: {exc}")
+    else:
+        print("Cursor editor state: not found (skipped)")
     with database(settings.database) as conn:
         missing = conn.execute(
             "SELECT DISTINCT provider||':'||model FROM usage WHERE cost_usd IS NULL ORDER BY 1"

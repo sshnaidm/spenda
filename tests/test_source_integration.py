@@ -47,6 +47,7 @@ def _combined_settings(tmp_path):
         codex_home, tmp_path / "dashboard.sqlite", running_window_seconds=0,
         opencode_database=opencode_database,
         claude_home=tmp_path / "missing-claude",
+        cursor_home=tmp_path / "missing-cursor", cursor_user_dir=tmp_path / "missing-cursor-user",
     )
 
 
@@ -64,7 +65,8 @@ def _page(app, path: str, source: str):
     return route(request, **kwargs).body.decode()
 
 
-def _add_claude_session(settings):
+def _add_session(settings, source: str, *, title: str, project: str, model: str, provider: str, home, event: str):
+    session_id = f"{source}:session"
     with database(settings.database) as conn:
         conn.execute(
             """INSERT INTO sessions(
@@ -72,14 +74,13 @@ def _add_claude_session(settings):
                    root_model,root_provider,source_app,source_home
                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                "claude:session", "claude:session", "Synthetic Claude task", "/work/claude",
-                "Synthetic Claude project", "2026-09-08T10:00:00Z", "2026-09-08T10:01:00Z",
-                "claude-model", "anthropic", "claude", str(settings.claude_home),
+                session_id, session_id, title, f"/work/{source}", project, "2026-09-08T10:00:00Z",
+                "2026-09-08T10:01:00Z", model, provider, source, str(home),
             ),
         )
         conn.execute(
             "INSERT INTO agents(thread_id,session_id,agent_role,source_kind) VALUES(?,?,?,?)",
-            ("claude:session", "claude:session", "root", "claude"),
+            (session_id, session_id, "root", source),
         )
         conn.execute(
             """INSERT INTO usage(
@@ -88,45 +89,71 @@ def _add_claude_session(settings):
                    output_tokens,reasoning_output_tokens,total_tokens,source_file,source_event_type,cost_usd
                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                "claude:message", "claude:session", "claude:session", "2026-09-08T10:00:30Z",
-                "claude-model", "anthropic", 100, 20, 0, 80, 30, 10, 130,
-                str(settings.claude_home / "projects" / "session.jsonl"), "claude_assistant_message", "0.12",
+                f"{source}:message", session_id, session_id, "2026-09-08T10:00:30Z",
+                model, provider, 100, 20, 0, 80, 30, 10, 130,
+                str(home / "projects" / "session.jsonl"), event, "0.12",
             ),
         )
+
+
+def _add_claude_session(settings):
+    _add_session(
+        settings, "claude", title="Synthetic Claude task", project="Synthetic Claude project",
+        model="claude-model", provider="anthropic", home=settings.claude_home, event="claude_assistant_message",
+    )
+
+
+def _add_cursor_session(settings):
+    _add_session(
+        settings, "cursor", title="Synthetic Cursor task", project="Synthetic Cursor project",
+        model="cursor-model", provider="cursor", home=settings.cursor_home, event="cursor_assistant_message",
+    )
 
 
 def test_combined_sources_are_available_in_every_source_filtered_report(tmp_path):
     settings = _combined_settings(tmp_path)
     summary = ingest_all(settings)
     assert (summary.root_sessions, summary.subagent_sessions) == (2, 2)
+    assert summary.cursor is None
     _add_claude_session(settings)
+    _add_cursor_session(settings)
 
     app = create_app(settings)
     health = next(route.endpoint for route in app.routes if route.path == "/healthz")
     assert health()["claude_home"] == str(settings.claude_home)
-    # Each view needs to retain both source filters.  These two values occur
-    # in the report body rather than in the shared navigation.
+    assert health()["cursor_home"] == str(settings.cursor_home)
+    # Each view needs to retain every source filter.  These values occur in
+    # the report body rather than in the shared navigation.
     pages = {
-        "/": ("Synthetic Codex task", "Synthetic OpenCode task", "Synthetic Claude task"),
-        "/sessions": ("Synthetic Codex task", "Synthetic OpenCode task", "Synthetic Claude task"),
-        "/models": ("gpt-5.6-sol", "opencode-model", "claude-model"),
-        "/projects": ("example-project", "Synthetic OpenCode project", "Synthetic Claude project"),
-        "/trends": ("gpt-5.6-sol", "opencode-model", "claude-model"),
+        "/": {
+            "codex": "Synthetic Codex task", "opencode": "Synthetic OpenCode task",
+            "claude": "Synthetic Claude task", "cursor": "Synthetic Cursor task",
+        },
+        "/sessions": {
+            "codex": "Synthetic Codex task", "opencode": "Synthetic OpenCode task",
+            "claude": "Synthetic Claude task", "cursor": "Synthetic Cursor task",
+        },
+        "/models": {
+            "codex": "gpt-5.6-sol", "opencode": "opencode-model", "claude": "claude-model", "cursor": "cursor-model",
+        },
+        "/projects": {
+            "codex": "example-project", "opencode": "Synthetic OpenCode project",
+            "claude": "Synthetic Claude project", "cursor": "Synthetic Cursor project",
+        },
+        "/trends": {
+            "codex": "gpt-5.6-sol", "opencode": "opencode-model", "claude": "claude-model", "cursor": "cursor-model",
+        },
     }
-    for path, (codex_value, opencode_value, claude_value) in pages.items():
+    for path, values in pages.items():
         all_body = _page(app, path, "all")
-        assert codex_value in all_body
-        assert opencode_value in all_body
-        assert claude_value in all_body
-
-        codex_body = _page(app, path, "codex")
-        opencode_body = _page(app, path, "opencode")
-        claude_body = _page(app, path, "claude")
-        assert codex_value in codex_body and opencode_value not in codex_body and claude_value not in codex_body
-        assert (
-            opencode_value in opencode_body and codex_value not in opencode_body and claude_value not in opencode_body
-        )
-        assert claude_value in claude_body and codex_value not in claude_body and opencode_value not in claude_body
+        for value in values.values():
+            assert value in all_body
+        for source, value in values.items():
+            body = _page(app, path, source)
+            assert value in body
+            for other_source, other_value in values.items():
+                if other_source != source:
+                    assert other_value not in body
 
     compare = next(route.endpoint for route in app.routes if route.path == "/compare")
     request = Request(
@@ -136,10 +163,10 @@ def test_combined_sources_are_available_in_every_source_filtered_report(tmp_path
         }
     )
     response = compare(
-        request, session=["codex-root", "opencode:root", "claude:session"], source="claude"
+        request, session=["codex-root", "opencode:root", "claude:session", "cursor:session"], source="cursor"
     )
-    assert [row["id"] for row in response.context["rows"]] == ["claude:session"]
-    assert set(response.context["model_costs"]) == {"claude:session"}
+    assert [row["id"] for row in response.context["rows"]] == ["cursor:session"]
+    assert set(response.context["model_costs"]) == {"cursor:session"}
 
 
 def test_cli_export_filters_combined_sources(tmp_path, capsys):
@@ -158,6 +185,13 @@ def test_cli_export_filters_combined_sources(tmp_path, capsys):
     exported = json.loads(capsys.readouterr().out)
     assert [(row["session_id"], row["source_app"]) for row in exported] == [
         ("claude:session", "claude")
+    ]
+
+    _add_cursor_session(settings)
+    assert export_command(settings, "json", "sessions", "-", source="cursor") == 0
+    exported = json.loads(capsys.readouterr().out)
+    assert [(row["session_id"], row["source_app"]) for row in exported] == [
+        ("cursor:session", "cursor")
     ]
 
 
@@ -189,6 +223,7 @@ def test_source_failure_is_reported_without_blocking_other_adapters(tmp_path):
     settings = Settings(
         tmp_path / "codex", tmp_path / "dashboard.sqlite",
         opencode_database=opencode_database, claude_home=claude_home,
+        cursor_home=tmp_path / "missing-cursor", cursor_user_dir=tmp_path / "missing-cursor-user",
     )
 
     summary = ingest_all(settings)
@@ -200,3 +235,23 @@ def test_source_failure_is_reported_without_blocking_other_adapters(tmp_path):
             "SELECT COUNT(*) FROM sessions WHERE source_app='claude'"
         ).fetchone()[0]
     assert claude_sessions == 1
+
+
+def test_cursor_adapter_runs_through_ingest_all_when_history_exists(tmp_path):
+    from test_cursor_ingestion import _fixture as cursor_fixture
+
+    home, user_dir = cursor_fixture(tmp_path)
+    settings = Settings(
+        tmp_path / "codex", tmp_path / "dashboard.sqlite", running_window_seconds=0,
+        opencode_database=tmp_path / "missing-opencode.sqlite", claude_home=tmp_path / "missing-claude",
+        cursor_home=home, cursor_user_dir=user_dir,
+    )
+
+    summary = ingest_all(settings)
+
+    assert summary.source_errors == {}
+    assert summary.cursor is not None and summary.cursor.root_sessions == 3
+    assert summary.root_sessions == 3
+    with database(settings.database, readonly=True) as conn:
+        sources = {row[0] for row in conn.execute("SELECT DISTINCT source_app FROM sessions")}
+    assert sources == {"cursor"}

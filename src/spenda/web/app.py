@@ -39,8 +39,10 @@ MODEL_PALETTE = (
     "blue", "coral", "green", "purple", "orange",
     "teal", "pink", "olive", "indigo", "rust",
 )
-SOURCES = ("all", "codex", "opencode", "claude")
-SOURCE_LABELS = {"all": "All", "codex": "Codex", "opencode": "OpenCode", "claude": "Claude Code"}
+SOURCES = ("all", "codex", "opencode", "claude", "cursor")
+SOURCE_LABELS = {
+    "all": "All", "codex": "Codex", "opencode": "OpenCode", "claude": "Claude Code", "cursor": "Cursor",
+}
 SESSION_SORT_KEYS = (
     "started", "source", "title", "project", "root_model", "models", "agents", "input",
     "cached", "output", "total", "cost", "duration",
@@ -553,6 +555,7 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
             "status": "ok", "database": str(settings.database),
             "codex_home": str(settings.codex_home), "opencode_database": str(settings.opencode_database),
             "claude_home": str(settings.claude_home),
+            "cursor_home": str(settings.cursor_home), "cursor_user_dir": str(settings.cursor_user_dir),
         }
 
     @app.get("/favicon.ico", include_in_schema=False)
