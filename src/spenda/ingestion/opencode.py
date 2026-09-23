@@ -51,6 +51,7 @@ class OpenCodeIngestSummary:
     unknown_models: set[str] = field(default_factory=set)
     unknown_prices: set[str] = field(default_factory=set)
     estimated_spend: float = 0.0
+    recorded_spend: float = 0.0
     source_database: Path | None = None
 
 
@@ -602,7 +603,7 @@ def ingest_opencode(settings: Settings, force_all: bool = False) -> OpenCodeInge
                     summary.duplicate_records += 1
                 else:
                     summary.usage_records += 1
-                    summary.estimated_spend += float(_cost(row["cost"]))
+                    summary.recorded_spend += float(_cost(row["cost"]))
 
             _delete_missing_source_rows(
                 target,

@@ -13,18 +13,31 @@ from decimal import Decimal
 from pathlib import Path
 
 from . import __version__
-from .config import Settings
+from .config import CLAUDE_BILLING_MODES, Settings
 from .db import database, initialize
-from .ingestion.claude import discover_claude_home
+from .ingestion.claude import claude_auth_profile, discover_claude_home
+from .ingestion.claude_auth import BACKEND_LABELS, BACKENDS
 from .ingestion.codex_state import read_state
 from .ingestion.cursor import cli_store_paths, discover_cursor_home, discover_cursor_user_dir, editor_state_path
 from .ingestion.opencode import discover_opencode_database
 from .ingestion.scanner import discover_rollouts
 from .ingestion.service import ingest_all as ingest
 from .pricing import add_price, reprice_usage, seed_prices
-from .reports import as_dict, format_cost, format_tokens, iso_date, session_rows
+from .reports import (
+    as_dict,
+    backend_row_sql,
+    backend_session_sql,
+    cost_sql,
+    format_cost,
+    format_tokens,
+    iso_date,
+    session_rows,
+    token_sum_sql,
+)
 
 log = logging.getLogger("spenda")
+SOURCE_CHOICES = ("all", "codex", "opencode", "claude", "cursor")
+BACKEND_CHOICES = ("all", *BACKENDS)
 
 
 def _add_config(parser: argparse.ArgumentParser) -> None:
@@ -36,8 +49,21 @@ def _add_config(parser: argparse.ArgumentParser) -> None:
         "--cursor-user-dir",
         help="Cursor editor user-data directory (default: CURSOR_USER_DIR or the platform Cursor/User path)",
     )
+    parser.add_argument(
+        "--claude-billing", choices=CLAUDE_BILLING_MODES,
+        help="How Anthropic-direct Claude calls are billed (default: SPENDA_CLAUDE_BILLING or auto-detect)",
+    )
     parser.add_argument("--database", help="Dashboard-owned SQLite database")
     parser.add_argument("--no-preview", action="store_true", help="Do not persist first-message previews")
+
+
+def _add_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--source", choices=SOURCE_CHOICES, default="all")
+    parser.add_argument("--backend", choices=BACKEND_CHOICES, default="all", help="Claude Code API backend")
+    parser.add_argument(
+        "--include-subscription", action="store_true",
+        help="Add the equivalent API value of claude.ai subscription usage to cost totals",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,7 +82,7 @@ def build_parser() -> argparse.ArgumentParser:
     sessions = sub.choices["sessions"]
     sessions.add_argument("--limit", type=int, default=30)
     sessions.add_argument("--sort", choices=("time", "cost", "tokens", "duration", "agents"), default="time")
-    sessions.add_argument("--source", choices=("all", "codex", "opencode", "claude", "cursor"), default="all")
+    _add_filters(sessions)
 
     ingest_p = sub.add_parser("ingest", help="Ingest new or changed coding-agent state")
     _add_config(ingest_p)
@@ -76,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(export)
     export.add_argument("--format", choices=("csv", "json"), required=True)
     export.add_argument("--breakdown", choices=("sessions", "models"), default="sessions")
-    export.add_argument("--source", choices=("all", "codex", "opencode", "claude", "cursor"), default="all")
+    _add_filters(export)
     export.add_argument("--output", "-o", default="-")
 
     rebuild = sub.add_parser("rebuild", help="Reimport derived data while preserving dashboard metadata")
@@ -110,6 +136,7 @@ def _settings(args: argparse.Namespace) -> Settings:
         claude_home=args.claude_home,
         cursor_home=args.cursor_home,
         cursor_user_dir=args.cursor_user_dir,
+        claude_billing=args.claude_billing,
     )
 
 
@@ -128,7 +155,15 @@ def _print_ingest(summary) -> None:
     print(f"Duplicate records ignored: {summary.duplicate_records}")
     print(f"Unknown models: {', '.join(sorted(summary.unknown_models)) or '0'}")
     print(f"Unknown prices: {', '.join(sorted(summary.unknown_prices)) or '0'}")
+    print(f"Source-recorded spend added: ${getattr(summary, 'recorded_spend', 0):.4f}")
     print(f"Estimated spend added: ${summary.estimated_spend:.4f}")
+    claude = getattr(summary, "claude", summary)
+    if getattr(claude, "subscription_value", 0):
+        print(f"Subscription equivalent value added: ${claude.subscription_value:.4f}")
+    if getattr(claude, "backends", None):
+        print("Claude backends: " + ", ".join(
+            f"{name}={count}" for name, count in sorted(claude.backends.items())
+        ))
     if summary.parser_warnings or summary.malformed_lines:
         print(f"Parser warnings: {summary.parser_warnings}; malformed lines: {summary.malformed_lines}")
     for source, error in getattr(summary, "source_errors", {}).items():
@@ -198,6 +233,34 @@ def doctor(settings: Settings) -> int:
         print(f"Claude Code transcripts: {transcripts}")
     else:
         print("Claude Code source: not found (skipped)")
+    profile = claude_auth_profile(settings)
+    print(f"Claude auth profile: {profile.config_path or 'not found'}")
+    print(f"Claude login: {profile.login}")
+    print(
+        f"Claude backend hints: vertex={str(profile.vertex_hint).lower()} "
+        f"bedrock={str(profile.bedrock_hint).lower()} api-key={str(profile.api_key_hint).lower()}"
+    )
+    print(
+        f"Claude Anthropic-direct calls billed as: {BACKEND_LABELS[profile.anthropic_backend]}"
+        f" ({'--claude-billing ' + profile.override if profile.override != 'auto' else 'auto-detected'})"
+    )
+    if profile.ambiguous and profile.api_key_configured:
+        print(
+            "Auth warning: both a claude.ai login and an API key were found; msg_ calls are recorded as "
+            "API usage because the active API key takes precedence. Pass --claude-billing subscription "
+            "if this history was subscription-backed."
+        )
+    elif profile.ambiguous:
+        print(
+            "Auth warning: an API key variable is set in Spenda's environment, but Claude Code's settings "
+            "configure none, so msg_ calls follow the claude.ai login. Pass --claude-billing api if Claude "
+            "Code ran with that key."
+        )
+    if profile.override == "auto" and profile.oauth and not profile.subscription and not profile.api_key_configured:
+        print(
+            "Auth warning: the claude.ai login's billing fields do not show a subscription plan, so msg_ "
+            "calls are recorded as unverified. Pass --claude-billing subscription or --claude-billing api."
+        )
     cursor_home = discover_cursor_home(settings)
     cursor_user_dir = discover_cursor_user_dir(settings)
     print(f"Cursor home: {cursor_home}")
@@ -226,19 +289,32 @@ def doctor(settings: Settings) -> int:
         print("Cursor editor state: not found (skipped)")
     with database(settings.database) as conn:
         missing = conn.execute(
-            "SELECT DISTINCT provider||':'||model FROM usage WHERE cost_usd IS NULL ORDER BY 1"
+            "SELECT DISTINCT provider||':'||model FROM usage WHERE billing_mode!='unresolved' "
+            "AND (cost_usd IS NULL OR (billing_mode='subscription' AND equivalent_cost_usd IS NULL)) ORDER BY 1"
         ).fetchall()
+        unresolved = conn.execute(
+            "SELECT COUNT(DISTINCT session_id) FROM usage WHERE billing_mode='unresolved'"
+        ).fetchone()[0]
         warnings = conn.execute("SELECT COUNT(*) FROM parser_warnings").fetchone()[0]
         resolved = conn.execute(
             "SELECT SUM(parent_thread_id IS NULL),SUM(parent_thread_id IS NOT NULL) FROM agents"
         ).fetchone()
         orphans = conn.execute("SELECT COUNT(*) FROM agents WHERE orphan=1").fetchone()[0]
         incomplete = conn.execute(
-            "SELECT COUNT(*) FROM sessions WHERE accounting_status!='complete'"
+            "SELECT COUNT(*) FROM sessions WHERE accounting_status NOT IN ('complete','estimated')"
         ).fetchone()[0]
+        estimated = conn.execute(
+            "SELECT COUNT(*) FROM sessions WHERE accounting_status='estimated'"
+        ).fetchone()[0]
+        by_backend = conn.execute(
+            "SELECT backend,COUNT(*) FROM usage WHERE backend IS NOT NULL GROUP BY backend ORDER BY backend"
+        ).fetchall()
     print(f"Dashboard resolved root/child agents: {int(resolved[0] or 0)} / {int(resolved[1] or 0)}")
     print(f"Orphan subagents: {orphans}")
     print(f"Sessions with incomplete accounting: {incomplete}")
+    print(f"Claude sessions priced from list prices: {estimated}")
+    print(f"Claude sessions with unresolved billing: {unresolved}")
+    print("Claude usage by backend: " + (", ".join(f"{row[0]}={row[1]}" for row in by_backend) or "none"))
     print(f"Models without prices: {', '.join(r[0] for r in missing) or 'none'}")
     print(f"Parser warnings: {warnings}")
     print(f"Dashboard database: {settings.database}")
@@ -247,38 +323,70 @@ def doctor(settings: Settings) -> int:
     return 0
 
 
-def sessions_command(settings: Settings, limit: int, sort: str, source: str = "all") -> int:
+def _session_filter(source: str, backend: str) -> tuple[str, tuple]:
+    clauses, params = [], []
+    if source != "all":
+        clauses.append("s.source_app=?")
+        params.append(source)
+    if backend != "all":
+        clauses.append(backend_session_sql(backend))
+        params.append(backend)
+    return " AND ".join(clauses) or "1=1", tuple(params)
+
+
+def sessions_command(
+    settings: Settings, limit: int, sort: str, source: str = "all", backend: str = "all",
+    include_subscription: bool = False,
+) -> int:
     _prepare(settings)
     with database(settings.database, readonly=True) as conn:
-        where, params = (("1=1", ()) if source == "all" else ("s.source_app=?", (source,)))
-        rows = session_rows(conn, where=where, params=params, order=sort, limit=limit)
+        where, params = _session_filter(source, backend)
+        rows = session_rows(
+            conn, where=where, params=params, order=sort, limit=limit,
+            include_subscription=include_subscription, backend=backend,
+        )
     print(
-        f"{'Started':16}  {'Source':8} {'Task':38}  {'Project':20}  "
-        f"{'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16}"
+        f"{'Started':16}  {'Source':8} {'Backend':16} {'Task':38}  {'Project':20}  "
+        f"{'Models':24} {'Agents':>6} {'Tokens':>10} {'Cost':>16} {'Sub. value':>12}"
     )
     for row in rows:
         title = (row["title"] or "(untitled)")[:38]
         project = (row["repo_name"] or row["cwd"] or "unknown")[-20:]
         models = (row["models_used"] or row["root_model"] or "unknown")[:24]
-        print(
-            f"{iso_date(row['created_at']):16}  {row['source_app']:8} {title:38}  {project:20}  {models:24} "
-            f"{row['agent_count']:6d} {format_tokens(row['total_tokens']):>10} "
-            f"{format_cost(row['known_cost_usd'], row['unknown_cost_records']):>16}"
+        backend_label = (row["root_backend"] or "-")[:16]
+        cost = format_cost(row["known_cost_usd"], row["unknown_cost_records"])
+        if row["accounting_status"] == "estimated":
+            cost += "*"
+        value = (
+            format_cost(row["equivalent_cost_usd"], row["unknown_value_records"])
+            if row["equivalent_cost_usd"] is not None or row["unknown_value_records"] else "-"
         )
+        print(
+            f"{iso_date(row['created_at']):16}  {row['source_app']:8} {backend_label:16} {title:38}  "
+            f"{project:20}  {models:24} {row['agent_count']:6d} {format_tokens(row['total_tokens']):>10} "
+            f"{cost:>16} {value:>12}"
+        )
+    if any(row["accounting_status"] == "estimated" for row in rows):
+        print("* estimated from built-in list prices (no Claude Code cost-state)")
     return 0
 
 
 SESSION_EXPORT_FIELDS = (
-    "session_id", "source_app", "date", "title", "project", "root_model", "models_used", "agent_count",
-    "input_tokens", "cached_input_tokens", "cache_write_input_tokens", "uncached_input_tokens",
-    "output_tokens", "reasoning_tokens", "total_tokens", "cost_usd", "known_cost_usd",
-    "unknown_cost_records", "duration_seconds", "tags",
+    "session_id", "source_app", "root_backend", "date", "title", "project", "root_model", "models_used",
+    "agent_count", "input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+    "uncached_input_tokens", "output_tokens", "reasoning_tokens", "total_tokens", "cost_usd",
+    "known_cost_usd", "unknown_cost_records", "equivalent_cost_usd", "unknown_value_records",
+    "accounting_status", "duration_seconds", "tags",
 )
 
 
-def _export_rows(conn, breakdown: str, source: str = "all") -> list[dict]:
-    def exact_cost(where: str, params: tuple) -> str | None:
-        values = conn.execute(f"SELECT cost_usd FROM usage WHERE {where} AND cost_usd IS NOT NULL", params)
+def _export_rows(
+    conn, breakdown: str, source: str = "all", backend: str = "all", include_subscription: bool = False,
+) -> list[dict]:
+    cost_column, unknown = cost_sql(include_subscription)
+
+    def exact_cost(where: str, params: tuple, column: str = "cost_usd") -> str | None:
+        values = conn.execute(f"SELECT {column} FROM usage u WHERE {where} AND {column} IS NOT NULL", params)
         total = Decimal("0")
         seen = False
         for value, in values:
@@ -286,37 +394,73 @@ def _export_rows(conn, breakdown: str, source: str = "all") -> list[dict]:
             seen = True
         return format(total, "f") if seen else None
 
+    def exact_total(where: str, params: tuple) -> str | None:
+        real = exact_cost(where, params)
+        if not include_subscription:
+            return real
+        value = exact_cost(where, params, "equivalent_cost_usd")
+        if real is None and value is None:
+            return None
+        return format(Decimal(real or "0") + Decimal(value or "0"), "f")
+
     if breakdown == "models":
-        source_where = "1=1" if source == "all" else "s.source_app=?"
-        source_params = () if source == "all" else (source,)
+        clauses, params = ["1=1"], []
+        if source != "all":
+            clauses.append("s.source_app=?")
+            params.append(source)
+        if backend != "all":
+            clauses.append(backend_row_sql(backend, "u"))
+            params.append(backend)
+        where = " AND ".join(clauses)
+        input_tokens = token_sum_sql("input_tokens")
+        cached_tokens = token_sum_sql("cached_input_tokens")
+        cache_write_tokens = token_sum_sql("cache_write_input_tokens")
+        uncached_tokens = token_sum_sql("uncached_input_tokens")
+        output_tokens = token_sum_sql("output_tokens")
+        reasoning_tokens = token_sum_sql("reasoning_output_tokens")
+        total_tokens = token_sum_sql("total_tokens")
         rows = conn.execute(
-            f"""SELECT u.session_id,s.source_app,u.model,u.provider,COUNT(DISTINCT u.thread_id) agent_count,
+            f"""SELECT u.session_id,s.source_app,u.model,u.provider,u.backend,u.billing_mode,
+               COUNT(DISTINCT u.thread_id) agent_count,
                SUM(source_event_type!='claude_cost_state') usage_events,
-               SUM(input_tokens) input_tokens,SUM(cached_input_tokens) cached_input_tokens,
-               SUM(cache_write_input_tokens) cache_write_input_tokens,SUM(uncached_input_tokens) uncached_input_tokens,
-               SUM(output_tokens) output_tokens,SUM(reasoning_output_tokens) reasoning_tokens,
-               SUM(total_tokens) total_tokens,SUM(CAST(cost_usd AS REAL)) known_cost_usd,
-               SUM(cost_usd IS NULL) unknown_cost_records FROM usage u JOIN sessions s ON s.id=u.session_id
-               WHERE {source_where} GROUP BY u.session_id,s.source_app,u.model,u.provider
+               {input_tokens} input_tokens,{cached_tokens} cached_input_tokens,
+               {cache_write_tokens} cache_write_input_tokens,{uncached_tokens} uncached_input_tokens,
+               {output_tokens} output_tokens,{reasoning_tokens} reasoning_tokens,
+               {total_tokens} total_tokens,SUM({cost_column}) known_cost_usd,
+               SUM(({unknown}) OR s.accounting_status NOT IN ('complete','estimated'))
+                   unknown_cost_records,
+               SUM(CAST(u.equivalent_cost_usd AS REAL)) equivalent_cost_usd
+               FROM usage u JOIN sessions s ON s.id=u.session_id
+               WHERE {where} GROUP BY u.session_id,s.source_app,u.model,u.provider,u.backend,u.billing_mode
                ORDER BY u.session_id,u.model""",
-            source_params,
+            tuple(params),
         ).fetchall()
         output = []
         for row in rows:
             data = dict(row)
-            data["known_cost_usd"] = exact_cost(
-                "session_id=? AND model=? AND provider=?",
-                (data["session_id"], data["model"], data["provider"]),
+            group = "session_id=? AND model=? AND provider=? AND backend IS ? AND billing_mode=?"
+            group_params = (
+                data["session_id"], data["model"], data["provider"], data["backend"], data["billing_mode"],
             )
+            data["known_cost_usd"] = exact_total(group, group_params)
+            data["equivalent_cost_usd"] = exact_cost(group, group_params, "equivalent_cost_usd")
             output.append(data)
         return output
     output = []
-    session_where, session_params = (("1=1", ()) if source == "all" else ("s.source_app=?", (source,)))
-    for row in session_rows(conn, where=session_where, params=session_params):
+    session_where, session_params = _session_filter(source, backend)
+    for row in session_rows(
+        conn, where=session_where, params=session_params, include_subscription=include_subscription,
+        backend=backend,
+    ):
         data = as_dict(row)
-        known_exact = exact_cost("session_id=?", (data["id"],))
+        exact_where = "session_id=?"
+        exact_params: tuple = (data["id"],)
+        if backend != "all":
+            exact_where += f" AND {backend_row_sql(backend, 'u')}"
+            exact_params = (*exact_params, backend)
+        known_exact = exact_total(exact_where, exact_params)
         output.append({
-            "session_id": data["id"], "source_app": data["source_app"],
+            "session_id": data["id"], "source_app": data["source_app"], "root_backend": data["root_backend"],
             "date": data["created_at"], "title": data["title"],
             "project": data["repo_name"] or data["cwd"], "root_model": data["root_model"],
             "models_used": data["models_used"], "agent_count": data["agent_count"],
@@ -326,18 +470,25 @@ def _export_rows(conn, breakdown: str, source: str = "all") -> list[dict]:
             "reasoning_tokens": data["reasoning_tokens"], "total_tokens": data["total_tokens"],
             "cost_usd": None if data["unknown_cost_records"] else known_exact,
             "known_cost_usd": known_exact,
-            "unknown_cost_records": data["unknown_cost_records"], "duration_seconds": data["duration_seconds"],
+            "unknown_cost_records": data["unknown_cost_records"],
+            "equivalent_cost_usd": exact_cost(
+                exact_where, exact_params, "equivalent_cost_usd"
+            ),
+            "unknown_value_records": data["unknown_value_records"],
+            "accounting_status": data["accounting_status"],
+            "duration_seconds": data["duration_seconds"],
             "tags": data["tags"],
         })
     return output
 
 
 def export_command(
-    settings: Settings, fmt: str, breakdown: str, output_path: str, source: str = "all"
+    settings: Settings, fmt: str, breakdown: str, output_path: str, source: str = "all",
+    backend: str = "all", include_subscription: bool = False,
 ) -> int:
     _prepare(settings)
     with database(settings.database, readonly=True) as conn:
-        rows = _export_rows(conn, breakdown, source)
+        rows = _export_rows(conn, breakdown, source, backend, include_subscription)
     handle = sys.stdout if output_path == "-" else open(output_path, "w", newline="", encoding="utf-8")
     try:
         if fmt == "json":
@@ -428,7 +579,9 @@ def main(argv: list[str] | None = None) -> int:
         _print_ingest(summary)
         return 1 if summary.source_errors else 0
     if args.command == "sessions":
-        return sessions_command(settings, args.limit, args.sort, args.source)
+        return sessions_command(
+            settings, args.limit, args.sort, args.source, args.backend, args.include_subscription
+        )
     if args.command == "prices":
         _prepare(settings)
         with database(settings.database, readonly=True) as conn:
@@ -467,7 +620,10 @@ def main(argv: list[str] | None = None) -> int:
         uvicorn.run(create_app(settings, ingest_interval=args.interval), host=args.host, port=args.port)
         return 0
     if args.command == "export":
-        return export_command(settings, args.format, args.breakdown, args.output, args.source)
+        return export_command(
+            settings, args.format, args.breakdown, args.output, args.source, args.backend,
+            args.include_subscription,
+        )
     if args.command == "rebuild":
         return rebuild(settings, args.yes)
     if args.command == "tag":

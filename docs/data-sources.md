@@ -70,14 +70,99 @@ only assistant content-block types and tool names to produce a fixed action
 label; content bodies and tool arguments are discarded.
 
 Assistant usage is keyed by `(sessionId, message.id)`. Streaming updates for
-the same message keep the latest record. Uncached input, cache-read input,
+the same message keep the latest record, including when Claude copies shared
+history into several subagent transcript files. Uncached input, cache-read input,
 cache-creation input, output, and thinking-token subsets map directly into the
-normalized token fields. Claude's output already includes thinking tokens.
+normalized token fields; the `cache_creation.ephemeral_1h_input_tokens` subset
+is kept as `cache_write_1h_input_tokens`. Claude's output already includes
+thinking tokens.
 
 `cost-state` records are cumulative. Consecutive snapshots become dated cost
 changes whose sum equals the latest source total, preserving historical trends
-without inventing per-message dollar allocations. A root cost state does not
-prove coverage of subagent usage, so those sessions remain partial.
+without inventing per-message dollar allocations. Claude Code's cumulative
+total covers the whole session including subagent calls (models that only
+appear in subagent transcripts are listed in the root's cost-state), so every
+call recorded up to the snapshot's timestamp is represented by that record.
+A snapshot does not cover calls recorded after it: a resumed session, or a
+subagent still running, adds calls that are priced like calls of a session
+without a cost-state until a later snapshot covers them.
+When `modelUsage` includes cumulative token counters, those counters are also
+authoritative for reports; transcript call rows remain auditable but do not add
+their copied or incomplete token totals again.
+
+The Claude session's turn count is the number of root records whose structured
+`origin.kind` is `human` (with a conservative fallback for older typed prompt
+envelopes). Tool results and generated task notifications are not user turns.
+Prompt bodies are never retained. A source session may contain several human
+prompts while keeping its original generated title, so the UI labels such rows
+with their prompt count.
+
+### API backend and billing
+
+Claude Code can talk to Anthropic directly, to Vertex AI, or to Amazon
+Bedrock, and a direct connection can be paid per token (API key) or covered by
+a claude.ai subscription (OAuth login). Every Claude usage row, agent, and
+session records a `backend` so these can be filtered and totaled separately:
+
+| `backend` | Detected from |
+|---|---|
+| `vertex` | `message.id` starts with `msg_vrtx_` or the envelope `requestId` starts with `req_vrtx_` |
+| `bedrock` | `message.id` starts with `msg_bdrk_` |
+| `anthropic-oauth` | `msg_` id and the home's login profile is a claude.ai subscription plan |
+| `anthropic-api` | `msg_` id and an API key or API-key helper is configured for Claude Code |
+| `anthropic` | `msg_` id and the billing is unverified (no login, or a login without subscription billing fields) |
+| `mixed` | a session or transcript whose calls used several backends |
+| `unknown` | no supported backend evidence is available |
+
+Transcripts do not say whether a direct call was paid by subscription or API
+key, so the adapter reads a small allow-list of non-secret scalar fields from
+the installation's login profile: `oauthAccount.billingType`,
+`oauthAccount.organizationType`, and `oauthAccount.organizationName` plus
+whether `customApiKeyResponses.approved` is non-empty from `.claude.json`
+(inside `CLAUDE_CONFIG_DIR`, otherwise the `~/.claude.json` sibling of the
+home), and from `settings.json` the presence of `apiKeyHelper` or of the
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_USE_VERTEX`,
+`CLAUDE_CODE_USE_BEDROCK`, `ANTHROPIC_VERTEX_PROJECT_ID`, and `CLOUD_ML_REGION`
+variables in its `env` block or in the process environment. Only the names
+of key variables are inspected, never their values. `.credentials.json` holds
+tokens and is never opened. Both JSON files are parsed in memory to find
+those fields, and nothing else from them is kept. A key or key helper in
+Claude Code's own `settings.json` outranks the OAuth login, matching Claude
+Code's credential precedence. A key variable that is only in Spenda's process
+environment says nothing about the logged-in Claude Code sessions, so it
+counts only when there is no login. A login counts as a subscription only
+when its `billingType` ends in `subscription` or its `organizationType` is a
+`claude_*` plan; any other login, for example a Console organization, leaves
+`msg_` calls as unverified `anthropic`. Historical key approval alone is
+diagnostic and does not prove that a key is currently active. `spenda
+doctor` reports the evidence and warns when the login and key evidence
+disagree.
+
+Because project directories are sometimes copied between machines, one home
+can hold sessions from several backends. Per-message detection is therefore
+primary, and the login profile only classifies `msg_` calls. When the profile
+is wrong for that history, `--claude-billing subscription|api` (or
+`SPENDA_CLAUDE_BILLING`) forces the classification. Changing the profile or
+the override rereads once every unit that has direct Anthropic calls, so
+their rows are relabeled; Vertex-only and Bedrock-only units stay skipped.
+
+Subscription usage has no metered charge. Its rows carry
+`billing_mode='subscription'`, a real `cost_usd` of `0`, and the list-price
+value of the calls in `equivalent_cost_usd`. Reports show real spend by
+default and offer an "Include subscription value" toggle. A cost-state whose
+snapshot spans subscription and metered calls cannot be split; its rows carry
+`billing_mode='unresolved'` with no real or equivalent value, and both totals
+report the session as unknown. Newly imported snapshots from an incomplete
+unit scan also keep the split unresolved, even if all readable calls appear
+metered: an unreadable child may contain subscription calls. Backends seen on
+an earlier complete scan remain evidence during a temporary read failure.
+
+Claude cost-state totals are whole-session source evidence. If a cost-state
+covers metered calls from more than one backend, the session is classified as
+`mixed`; its total is not prorated and component backend filters exclude it. Without cost-state,
+only direct Anthropic API or subscription calls are estimated from first-party
+prices. Bedrock, Vertex, and unclassified direct calls stay unpriced because
+the transcript does not establish a safe provider/region/service-tier price.
 
 Claude scans import valid records from a readable transcript even when another
 line or transcript has an error. Destructive reconciliation is limited to
@@ -91,7 +176,13 @@ membership and fingerprints are all unchanged is skipped without opening any
 file; its rows are left alone by reconciliation and only its running or
 completed status is recomputed from the stored activity timestamp. A change to
 any file, a new or removed subagent transcript, or `spenda ingest --all`
-rereads the whole unit.
+rereads the whole unit. A unit that could not be read completely has its
+fingerprints dropped, so the next pass retries it even when nothing changed on
+disk. While its root transcript is unreadable, a previously imported complete
+cost-state remains authoritative and readable subagent calls are not estimated
+against it (see [accounting.md](accounting.md)). Repricing does not clear an
+incomplete unit's accounting warning merely because its readable calls now
+have prices.
 
 ## Cursor
 

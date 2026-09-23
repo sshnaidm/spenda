@@ -36,6 +36,15 @@ def _default_cursor_user_dir() -> Path:
     return config_home / "Cursor" / "User"
 
 
+CLAUDE_BILLING_MODES = ("auto", "subscription", "api")
+
+
+def _default_claude_billing() -> str:
+    """Return how Anthropic-direct Claude calls are billed when transcripts cannot say."""
+    value = os.environ.get("SPENDA_CLAUDE_BILLING", "auto").strip().lower()
+    return value if value in CLAUDE_BILLING_MODES else "auto"
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     codex_home: Path
@@ -48,9 +57,14 @@ class Settings:
     claude_home: Path = field(default_factory=_default_claude_home)
     cursor_home: Path = field(default_factory=_default_cursor_home)
     cursor_user_dir: Path = field(default_factory=_default_cursor_user_dir)
+    # "auto" derives subscription-vs-API-key from the Claude home's login
+    # profile; "subscription" or "api" forces it, e.g. for copied project dirs.
+    claude_billing: str = field(default_factory=_default_claude_billing)
 
     def validate(self) -> Settings:
         """Reject configurations that could write into source-owned state."""
+        if self.claude_billing not in CLAUDE_BILLING_MODES:
+            raise ValueError(f"claude_billing must be one of {CLAUDE_BILLING_MODES}: {self.claude_billing}")
         codex_home = self.codex_home.resolve()
         database = self.database.resolve()
         opencode_database = self.opencode_database.resolve()
@@ -91,6 +105,7 @@ class Settings:
         claude_home: str | Path | None = None,
         cursor_home: str | Path | None = None,
         cursor_user_dir: str | Path | None = None,
+        claude_billing: str | None = None,
     ) -> Settings:
         home = Path(codex_home or os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
         data_home = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
@@ -107,4 +122,5 @@ class Settings:
             home.resolve(), db.resolve(), keep_preview,
             opencode_database=opencode_db.resolve(), claude_home=claude.resolve(),
             cursor_home=cursor.resolve(), cursor_user_dir=cursor_user.resolve(),
+            claude_billing=claude_billing or _default_claude_billing(),
         ).validate()
