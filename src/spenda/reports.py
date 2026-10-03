@@ -177,9 +177,14 @@ def session_rows(
     }
     expression = allowed_orders.get(order, allowed_orders["started"])
     order_direction = "ASC" if direction.lower() == "asc" else "DESC"
+    order_by = f"{expression} {order_direction}"
+    if order == "cost":
+        # Subscription sessions all carry a $0 real cost; rank those ties by
+        # their equivalent API value so the sort follows the "+$… sub." figure.
+        order_by += f", COALESCE(u.equivalent_cost_usd,0.0) {order_direction}"
     sql = (
         session_aggregate_sql(include_subscription, backend=backend, since=since)
-        + f" WHERE {where} ORDER BY {expression} {order_direction}, s.created_at DESC, s.id"
+        + f" WHERE {where} ORDER BY {order_by}, s.created_at DESC, s.id"
     )
     aggregate_params: tuple[Any, ...] = ()
     if backend != "all":

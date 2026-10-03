@@ -13,6 +13,7 @@ from spenda.config import Settings
 from spenda.db import database
 from spenda.ingestion.service import ingest_all
 from spenda.pricing import CLAUDE_COVERED_NOTE
+from spenda.reports import session_rows
 from spenda.web.app import create_app
 from test_claude_ingestion import _fixture
 from test_opencode_ingestion import _source_db
@@ -407,6 +408,24 @@ def test_cli_export_filters_by_backend_and_includes_subscription_value(tmp_path,
     assert [(row["backend"], row["billing_mode"], row["known_cost_usd"]) for row in included] == [
         ("anthropic-oauth", "subscription", "0.5")
     ]
+
+
+def test_cost_sort_ranks_subscription_sessions_by_equivalent_value(tmp_path):
+    settings = _combined_settings(tmp_path)
+    ingest_all(settings)
+    for ident, equivalent in (("low", "0.8"), ("high", "430.4"), ("mid", "42.5")):
+        _add_claude_session(
+            settings, session_id=f"claude:{ident}", backend="anthropic-oauth", cost="0", equivalent=equivalent
+        )
+    _add_claude_session(settings, session_id="claude:metered", backend="vertex", cost="0.12")
+
+    added = "s.id IN ('claude:low','claude:high','claude:mid','claude:metered')"
+    with database(settings.database, readonly=True) as conn:
+        descending = [row["id"] for row in session_rows(conn, where=added, order="cost", direction="desc")]
+        ascending = [row["id"] for row in session_rows(conn, where=added, order="cost", direction="asc")]
+
+    assert descending == ["claude:metered", "claude:high", "claude:mid", "claude:low"]
+    assert ascending == ["claude:low", "claude:mid", "claude:high", "claude:metered"]
 
 
 def test_session_detail_does_not_silently_truncate_usage_records(tmp_path):
