@@ -418,6 +418,58 @@ def test_claude_reconciles_removed_subagent_and_preserves_codex(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='codex:kept'").fetchone()[0] == 1
 
 
+@pytest.mark.parametrize("other_has_transcript", [False, True])
+def test_claude_reconciliation_preserves_other_home(tmp_path, other_has_transcript):
+    home = tmp_path / "claude"
+    root, child = _fixture(home)
+    settings = _Settings(tmp_path / "dashboard.sqlite", home)
+    ingest_claude(settings)
+    with database(settings.database, readonly=True) as conn:
+        session = tuple(conn.execute("SELECT * FROM sessions WHERE id='claude:root'").fetchone())
+        agents = [tuple(row) for row in conn.execute(
+            "SELECT * FROM agents WHERE session_id='claude:root' ORDER BY thread_id"
+        )]
+        usage = [tuple(row) for row in conn.execute(
+            "SELECT * FROM usage WHERE session_id='claude:root' ORDER BY id"
+        )]
+        fingerprints = [tuple(row) for row in conn.execute(
+            "SELECT * FROM ingestion_state ORDER BY source_path"
+        )]
+
+    other_home = tmp_path / "other-claude"
+    (other_home / "projects").mkdir(parents=True)
+    if other_has_transcript:
+        other_root = _write_root(other_home, "other", _assistant(
+            session="other", message_id="other-message", timestamp="2026-09-01T10:00:00Z",
+            input_tokens=8, output_tokens=9,
+        ))
+    other_settings = _Settings(settings.database, other_home)
+    ingest_claude(other_settings)
+    if other_has_transcript:
+        with database(settings.database, readonly=True) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='claude:other'").fetchone()[0] == 1
+        other_root.unlink()
+        ingest_claude(other_settings)
+
+    with database(settings.database, readonly=True) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE id='claude:other'").fetchone()[0] == 0
+        stored_session = conn.execute("SELECT * FROM sessions WHERE id='claude:root'").fetchone()
+        assert stored_session is not None
+        assert tuple(stored_session) == session
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM agents WHERE session_id='claude:root' ORDER BY thread_id"
+        )] == agents
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM usage WHERE session_id='claude:root' ORDER BY id"
+        )] == usage
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM ingestion_state ORDER BY source_path"
+        )] == fingerprints
+
+    summary = ingest_claude(settings)
+    assert summary.unchanged_files == len((root, child))
+
+
 def test_complete_root_cost_state_covers_subagent_usage(tmp_path):
     """Claude Code's cumulative cost-state already includes subagent calls."""
 

@@ -168,7 +168,9 @@ calls stay unpriced because they may be subscription usage.
 Claude scans import valid records from a readable transcript even when another
 line or transcript has an error. Destructive reconciliation is limited to
 complete, readable scope: a fully read transcript can reconcile its own rows,
-and removal of missing transcripts requires a complete directory scan.
+and removal of missing transcripts requires a complete directory scan. A scan
+reconciles only the selected Claude home; sessions, usage, and fingerprints
+imported from other Claude homes are preserved.
 
 A root transcript and its subagent transcripts are one unit. After a unit is
 read completely, the inode, size, and mtime of each of its files are recorded

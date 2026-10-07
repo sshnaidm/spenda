@@ -231,11 +231,12 @@ def _group_of(path: str, projects: Path) -> str | None:
     return transcript.root_external_id if transcript is not None else None
 
 
-def _prune_fingerprints(conn, current_paths: set[str]) -> None:
+def _prune_fingerprints(conn, current_paths: set[str], projects: Path) -> None:
     stored = {
         row[0] for row in conn.execute(
             "SELECT source_path FROM ingestion_state WHERE source_key LIKE 'claude:%'"
         )
+        if _group_of(row[0], projects) is not None
     }
     conn.executemany(
         "DELETE FROM ingestion_state WHERE source_key=?",
@@ -886,24 +887,27 @@ def _reconcile_transcript_records(
 
 
 def _reconcile(
-    conn, *, transcript_ids: set[str], usage_ids: set[str], keep_files: set[str]
+    conn, *, source_home: Path, transcript_ids: set[str], usage_ids: set[str], keep_files: set[str]
 ) -> None:
+    scope = "session_id IN (SELECT id FROM sessions WHERE source_app='claude' AND source_home=?)"
+    params = (str(source_home),)
     _remove_stale_usage(
         conn, event=_ASSISTANT_EVENT,
-        scope="source_record_identity LIKE 'claude:%'", params=(),
+        scope=scope, params=params,
         identities={item for item in usage_ids if not item.startswith(_ns("cost:"))},
         keep_files=keep_files,
     )
     _remove_stale_usage(
         conn, event=_COST_EVENT,
-        scope="source_record_identity LIKE 'claude:%'", params=(),
+        scope=scope, params=params,
         identities={item for item in usage_ids if item.startswith(_ns("cost:"))},
         keep_files=keep_files,
     )
 
     stored_transcripts = {
         row[0] for row in conn.execute(
-            "SELECT thread_id FROM agents WHERE source_kind='claude' AND thread_id LIKE 'claude:%'"
+            "SELECT thread_id FROM agents WHERE source_kind='claude' AND thread_id LIKE 'claude:%' "
+            f"AND {scope}", params,
         )
     }
     conn.executemany(
@@ -911,8 +915,8 @@ def _reconcile(
         ((identity,) for identity in stored_transcripts - transcript_ids),
     )
     conn.execute(
-        "DELETE FROM sessions WHERE source_app='claude' AND id LIKE 'claude:%' "
-        "AND NOT EXISTS(SELECT 1 FROM agents WHERE agents.session_id=sessions.id)"
+        "DELETE FROM sessions WHERE source_app='claude' AND id LIKE 'claude:%' AND source_home=? "
+        "AND NOT EXISTS(SELECT 1 FROM agents WHERE agents.session_id=sessions.id)", params,
     )
 
 
@@ -1327,10 +1331,10 @@ def ingest_claude(
                     summary.recorded_spend += float(cost)
         if scan_complete:
             _reconcile(
-                conn, transcript_ids=current_transcript_ids, usage_ids=current_usage_ids,
+                conn, source_home=home, transcript_ids=current_transcript_ids, usage_ids=current_usage_ids,
                 keep_files=skipped_files,
             )
-            _prune_fingerprints(conn, set(fingerprints))
+            _prune_fingerprints(conn, set(fingerprints), projects)
         else:
             # A failure elsewhere must not block safe replacement within a
             # transcript that was itself read completely.
