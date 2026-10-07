@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 import spenda.ingestion.claude as claude_module
-from spenda.db import database
+from spenda.db import database, initialize
 from spenda.ingestion.claude import discover_claude_home, ingest_claude
 from spenda.pricing import add_price, reprice_usage
 from spenda.reports import session_detail
@@ -1905,3 +1905,40 @@ def test_vertex_calls_after_last_cost_state_are_estimated(tmp_path):
         detail = session_detail(conn, "claude:root")
     assert status == "estimated"
     assert detail["known_cost_usd"] == pytest.approx(7)
+
+
+def test_reread_counts_calls_estimated_after_they_were_stored(tmp_path):
+    """A parser upgrade that fills a previously unpriced row is spend added."""
+
+    home = tmp_path / "claude"
+    _write_root(
+        home, "root",
+        _assistant(
+            session="root", message_id="msg_01", timestamp="2026-09-01T10:00:00Z",
+            model="claude-future", input_tokens=1_000_000, output_tokens=0,
+            cache_read=0, cache_write=0,
+        ),
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home, claude_billing="api")
+    initialize(settings.database)
+    with database(settings.database) as conn:
+        add_price(
+            conn, model="claude-future", provider="anthropic", effective_from="2026-01-01T00:00:00Z",
+            input_per_million="2", cached_input_per_million="1", cache_write_per_million="1",
+            output_per_million="1", source="test",
+        )
+    first = ingest_claude(settings)
+    assert first.estimated_spend == 2
+    assert first.usage_records == 1
+
+    with database(settings.database) as conn:
+        conn.execute("UPDATE usage SET cost_usd=NULL, price_id=NULL, pricing_note=NULL")
+        conn.execute("DELETE FROM ingestion_state")
+    second = ingest_claude(settings)
+    assert second.duplicate_records == 1
+    assert second.usage_records == 0
+    assert second.estimated_spend == 2
+    with database(settings.database, readonly=True) as conn:
+        stored = conn.execute("SELECT cost_usd FROM usage").fetchone()[0]
+    assert float(stored) == 2
+    assert ingest_claude(settings).estimated_spend == 0

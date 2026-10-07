@@ -445,7 +445,9 @@ def _scan_file(
                     (parsed.call_label, parsed.identity),
                 )
             if parsed.service_tier:
-                _backfill_service_tier(conn, parsed.identity, parsed.service_tier, cost)
+                summary.estimated_spend += _backfill_service_tier(
+                    conn, parsed.identity, parsed.service_tier, cost,
+                )
             summary.duplicate_records += 1
     end_offset = start + complete_bytes
     previous_json = context_json(parser.context.previous_cumulative)
@@ -473,9 +475,20 @@ def _scan_file(
     )
 
 
-def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, cost) -> None:
-    """Record the tier of a call ingested before tiers were parsed and reprice it."""
-    conn.execute(
+def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, cost) -> float:
+    """Record the tier of a call ingested before tiers were parsed and reprice it.
+
+    Returns the change in stored cost so the ingest summary includes calls
+    repriced on this pass, not only rows inserted for the first time.
+    """
+    previous = conn.execute(
+        """SELECT cost_usd FROM usage WHERE source_record_identity=? AND service_tier IS NULL
+           AND source_event_type NOT GLOB 'opencode_*'""",
+        (identity,),
+    ).fetchone()
+    if previous is None:
+        return 0.0
+    cursor = conn.execute(
         """UPDATE usage SET service_tier=?,price_id=?,uncached_input_usd=?,cached_input_usd=?,
            cache_write_usd=?,output_usd=?,cost_usd=?,pricing_note=?
            WHERE source_record_identity=? AND service_tier IS NULL AND source_event_type NOT GLOB 'opencode_*'""",
@@ -487,6 +500,11 @@ def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, c
             cost.note, identity,
         ),
     )
+    if not cursor.rowcount:
+        return 0.0
+    old = 0.0 if previous[0] is None else float(previous[0])
+    new = 0.0 if cost.total_usd is None else float(cost.total_usd)
+    return new - old
 
 
 def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:

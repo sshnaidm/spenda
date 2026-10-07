@@ -714,6 +714,20 @@ def _usage_values(
     )
 
 
+
+def _add_repriced(summary: ClaudeIngestSummary, previous: str | None, cost, billing: str) -> None:
+    """Count the cost change of a row that already existed."""
+
+    new = None if cost is None or cost.total_usd is None else float(cost.total_usd)
+    old = 0.0 if previous is None else float(previous)
+    delta = (0.0 if new is None else new) - old
+    if not delta:
+        return
+    if billing == "subscription":
+        summary.subscription_value += delta
+    else:
+        summary.estimated_spend += delta
+
 def _upsert_usage(conn, values: tuple[Any, ...]) -> bool:
     identity = values[0]
     exists = conn.execute("SELECT 1 FROM usage WHERE source_record_identity=?", (identity,)).fetchone()
@@ -1259,8 +1273,13 @@ def ingest_claude(
                 covered_by_token_state=root_token_coverage.get(record.session_id, False) and not late,
                 cost=cost, withheld=not covered and not estimable,
             )
+            previous_cost = conn.execute(
+                "SELECT cost_usd FROM usage WHERE source_record_identity=?",
+                (record.identity,),
+            ).fetchone()
             if _upsert_usage(conn, values):
                 summary.duplicate_records += 1
+                _add_repriced(summary, previous_cost[0] if previous_cost else None, cost, _billing_mode(record.backend))
             else:
                 summary.usage_records += 1
                 if cost is not None and cost.total_usd is not None:
