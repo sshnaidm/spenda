@@ -2,6 +2,8 @@
 
 Contributions to Spenda are welcome. Changes should preserve accurate accounting, source isolation, and the privacy boundary described below.
 
+Using an AI coding agent? Point it at [AGENTS.md](AGENTS.md), which summarizes these rules and the project's common pitfalls. Claude Code reads it through `CLAUDE.md`.
+
 ## Development setup
 
 Install Python 3.11 or newer and [uv](https://docs.astral.sh/uv/), then create the development environment:
