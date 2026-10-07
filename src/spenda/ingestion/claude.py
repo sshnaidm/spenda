@@ -23,7 +23,9 @@ from ..pricing import (
     BILLING_UNRESOLVED,
     CLAUDE_COVERED_NOTE,
     CLAUDE_LATE_CALLS_NOTE,
+    CLAUDE_LIST_PRICED_BACKENDS,
     CLAUDE_NO_COST_STATE_NOTE,
+    CLAUDE_WITHHELD_NOTE,
     FAST_MODE_NOTE,
     claude_estimate_note,
     claude_estimate_status,
@@ -38,9 +40,7 @@ from .claude_auth import (
     BACKEND_ANTHROPIC,
     BACKEND_ANTHROPIC_API,
     BACKEND_ANTHROPIC_OAUTH,
-    BACKEND_BEDROCK,
     BACKEND_MIXED,
-    BACKEND_VERTEX,
     ClaudeAuthProfile,
     message_backend,
     read_auth_profile,
@@ -58,9 +58,7 @@ _PARTIAL_COST_STATE_NOTE = (
     "Claude Code cost-state reports unknown model cost; cumulative session cost is partial"
 )
 _COVERED_NOTE = CLAUDE_COVERED_NOTE
-_WITHHELD_NOTE = (
-    "included in a partial or unreadable Claude Code cost-state; not priced separately to avoid double counting"
-)
+_WITHHELD_NOTE = CLAUDE_WITHHELD_NOTE
 _UNVERIFIED_NOTE = (
     "Anthropic billing is unverified (no subscription login or API key found); pass --claude-billing to classify"
 )
@@ -70,7 +68,7 @@ _UNRESOLVED_UNVERIFIED = "includes Anthropic calls whose billing is unverified"
 _UNRESOLVED_MIXED = "spans subscription and metered backends"
 # Bump when the values derived from a transcript change, so recorded
 # fingerprints from an older parser stop suppressing a reread.
-PARSER_VERSION = 6
+PARSER_VERSION = 7
 
 
 @dataclass(slots=True)
@@ -696,18 +694,13 @@ def _usage_values(
             (cost.uncached_input_usd, cost.cached_input_usd, cost.cache_write_usd, cost.output_usd)
         )
         cost_usd, equivalent = subscription_split(str(cost.total_usd), subscription)
-        note = claude_estimate_note(subscription, cost.note)
+        note = claude_estimate_note(subscription, cost.note, record.backend)
     else:
         cost_usd, equivalent = ("0", None) if subscription else (None, None)
         if withheld:
             note = _WITHHELD_NOTE
         elif record.backend == BACKEND_ANTHROPIC:
             note = _UNVERIFIED_NOTE
-        elif record.backend in (BACKEND_VERTEX, BACKEND_BEDROCK):
-            note = (
-                f"strict accounting: {record.backend} backend/region price is not present in the transcript; "
-                "Claude transcript has no complete cumulative cost-state"
-            )
         else:
             note = claude_no_price_note(record.model)
     return (
@@ -1235,13 +1228,13 @@ def ingest_claude(
             # Orphaned subagent transcripts have no root and no cost-state, so
             # their rows are estimated like any unit without a cost-state.
             estimable = late or record.session_id in estimable_roots or record.session_id not in coverage_notes
-            # Strict accounting: first-party Anthropic calls can use the
-            # captured Anthropic list prices. Partner-operated Bedrock and
-            # Vertex calls have backend/region-specific billing that the
-            # transcript does not expose, so they remain unknown without a
-            # Claude Code cost-state instead of receiving a fabricated price.
-            direct_backend = record.backend in (BACKEND_ANTHROPIC_API, BACKEND_ANTHROPIC_OAUTH)
-            if not covered and estimable and direct_backend and not record.fast:
+            # Calls no cost-state covers are estimated from Anthropic list
+            # prices so totals include every call.  Vertex AI and Bedrock list
+            # the same base prices; their regional premiums are not modeled.
+            # Calls with unverified Anthropic billing stay unpriced, since they
+            # may be subscription usage.
+            list_priced = record.backend in CLAUDE_LIST_PRICED_BACKENDS
+            if not covered and estimable and list_priced and not record.fast:
                 cost = estimate_cost(
                     conn, _token_usage(record), record.model, PROVIDER, record.timestamp,
                     cache_write_1h_tokens=record.cache_write_1h,
@@ -1250,8 +1243,6 @@ def ingest_claude(
             if not priced:
                 if record.fast:
                     missing_price = f"{PROVIDER}:{record.model}:fast"
-                elif record.backend in (BACKEND_VERTEX, BACKEND_BEDROCK):
-                    missing_price = f"{record.backend}:{record.model}:backend-price-unavailable"
                 else:
                     missing_price = f"{PROVIDER}:{record.model}"
                 summary.unknown_prices.add(missing_price)

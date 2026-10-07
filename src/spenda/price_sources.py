@@ -20,7 +20,15 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from .pricing import find_price, no_fast_price_note, price_model, reprice_usage, repriceable_clauses, utc_timestamp
+from .pricing import (
+    find_price,
+    no_fast_price_note,
+    price_model,
+    reprice_usage,
+    repriceable_clauses,
+    timestamp_instant,
+    utc_timestamp,
+)
 
 log = logging.getLogger(__name__)
 
@@ -109,18 +117,32 @@ def _unpriced(conn: sqlite3.Connection) -> dict[tuple[str, str], tuple[set[str],
     # model has a price; repricing it on every pass would change nothing.
     no_fast = no_fast_price_note("")
     rows = conn.execute(
-        f"SELECT provider,model,MIN(timestamp) FROM usage WHERE {' AND '.join(clauses)} "
+        f"SELECT DISTINCT provider,model,timestamp FROM usage WHERE {' AND '.join(clauses)} "
         f"AND price_id IS NULL AND provider IN ({placeholders}) AND model!='unknown-model' "
-        "AND substr(COALESCE(pricing_note,''),1,?)!=? GROUP BY provider,model",
+        "AND substr(COALESCE(pricing_note,''),1,?)!=?",
         (*params, *PROVIDERS, len(no_fast), no_fast),
     ).fetchall()
     found: dict[tuple[str, str], tuple[set[str], str]] = {}
-    for provider, model, first in rows:
+    for provider, model, stamp in rows:
+        instant = timestamp_instant(stamp)
+        if instant is None:
+            continue
         lookup = price_model(model) if provider == "anthropic" else model
-        models, earliest = found.get((provider, lookup), (set(), first))
+        models, earliest = found.get((provider, lookup), (set(), stamp))
         models.add(model)
-        found[(provider, lookup)] = (models, min(earliest, first))
+        # Ordered as instants: as strings "...02.500Z" sorts before "...02Z".
+        found[(provider, lookup)] = (models, stamp if instant < timestamp_instant(earliest) else earliest)
     return found
+
+
+def still_unpriced(conn: sqlite3.Connection, names: list[str]) -> set[str]:
+    """Return the ``provider:model`` names that still have calls without any cost."""
+    rows = conn.execute(
+        "SELECT DISTINCT provider,model FROM usage WHERE price_id IS NULL "
+        "AND cost_usd IS NULL AND equivalent_cost_usd IS NULL"
+    ).fetchall()
+    remaining = {f"{provider}:{price_model(model) if provider == 'anthropic' else model}" for provider, model in rows}
+    return remaining & set(names)
 
 
 def _reprice(conn: sqlite3.Connection, provider: str, models: set[str]) -> None:

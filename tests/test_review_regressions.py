@@ -367,3 +367,31 @@ def test_background_ingestion_does_not_block_event_loop(dashboard_settings, monk
     gaps = asyncio.run(exercise())
     assert calls >= 2
     assert max(gaps) < 0.075
+
+
+def test_session_page_shows_dash_for_calls_without_their_own_cost(dashboard_settings):
+    from spenda.pricing import CLAUDE_COVERED_NOTE
+
+    path = dashboard_settings.codex_home / "sessions" / "2026" / "09" / "08" / "rollout-root.jsonl"
+    write_rollout(path, [
+        session_meta("root"), turn("t"), atomic("root", "t", "priced"), atomic("root", "t", "covered", ordinal=3),
+        turn("u", "gpt-9-unknown", 4), atomic("root", "u", "unpriced", ordinal=5),
+    ])
+    make_state(dashboard_settings.codex_home, [thread("root", path)])
+    ingest(dashboard_settings)
+    with database(dashboard_settings.database) as conn:
+        conn.execute(
+            "UPDATE usage SET cost_usd='0',price_id=NULL,pricing_note=? WHERE response_id='covered'",
+            (CLAUDE_COVERED_NOTE,),
+        )
+    app = create_app(dashboard_settings)
+    request = Request(
+        {"type": "http", "method": "GET", "path": "/sessions/root", "headers": [], "query_string": b"", "app": app}
+    )
+    route = next(route.endpoint for route in app.routes if route.path == "/sessions/{session_id}")
+    body = route(request, "root").body.decode()
+    calls = body[body.index("Auditable usage records"):]
+    assert calls.count('<td class="muted" title="Included in the session&#39;s Claude Code cost total, '
+                       'which is not split per call.">—</td>') == 1
+    assert calls.count('<td class="muted" title="Not priced, so not included in totals: unknown price">—</td>') == 1
+    assert "$0.0000" not in calls and " <span class=\"muted\">est.</span>" in calls

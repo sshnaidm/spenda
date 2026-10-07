@@ -18,7 +18,7 @@ from ..config import Settings
 from ..db import database, initialize
 from ..ingestion.claude_auth import BACKEND_LABELS, BACKEND_MIXED, BACKENDS
 from ..ingestion.service import ingest_all as ingest
-from ..pricing import seed_prices
+from ..pricing import CLAUDE_COVERED_NOTE, CLAUDE_WITHHELD_NOTE, seed_prices
 from ..reports import (
     backend_row_sql,
     backend_session_sql,
@@ -361,6 +361,11 @@ def create_app(settings: Settings | None = None, *, ingest_interval: float = 10)
         tokens=format_tokens, cost=format_cost, duration=format_duration, isodate=iso_date,
         modelstyle=_model_style,
     )
+    # Calls whose dollars sit in a session-level Claude Code cost total.
+    templates.env.globals["session_total_notes"] = {
+        CLAUDE_COVERED_NOTE: "Included in the session's Claude Code cost total, which is not split per call.",
+        CLAUDE_WITHHELD_NOTE: "Included in the session's partial Claude Code cost total, which is not split per call.",
+    }
 
     def render(request: Request, name: str, **context):
         source = _source(context.pop("source", "all"))

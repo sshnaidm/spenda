@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 from ..config import Settings
 from ..db import database
-from ..price_sources import fetch_enabled, fill_missing_prices
+from ..price_sources import fetch_enabled, fill_missing_prices, still_unpriced
 from .claude import ClaudeIngestSummary, discover_claude_home, ingest_claude
 from .cursor import CursorIngestSummary, cursor_sources_present, ingest_cursor
 from .opencode import OpenCodeIngestSummary, ingest_opencode
@@ -64,6 +64,7 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
         cursor = attempt("cursor", lambda: ingest_cursor(settings, force_all=force_all))
 
     fetched: list[str] = []
+    resolved: set[str] = set()
     repriced_spend = 0.0
     if settings.database.exists():
         try:
@@ -71,6 +72,8 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
                 total = "SELECT COALESCE(SUM(CAST(cost_usd AS REAL)),0) FROM usage"
                 before = conn.execute(total).fetchone()[0]
                 fetched = fill_missing_prices(conn, fetch_remote=fetch_enabled())
+                # A fetched standard price can leave Fast-mode calls unpriced.
+                resolved = set(fetched) - still_unpriced(conn, fetched)
                 # Calls priced after their adapter ran were counted as $0 in its summary.
                 repriced_spend = conn.execute(total).fetchone()[0] - before
         except Exception as exc:
@@ -87,7 +90,7 @@ def ingest_all(settings: Settings, *, force_all: bool = False) -> CombinedIngest
         malformed_lines=sum(item.malformed_lines for item in summaries),
         parser_warnings=sum(item.parser_warnings for item in summaries),
         unknown_models=set().union(*(item.unknown_models for item in summaries)),
-        unknown_prices=set().union(*(item.unknown_prices for item in summaries)) - set(fetched),
+        unknown_prices=set().union(*(item.unknown_prices for item in summaries)) - resolved,
         estimated_spend=sum(item.estimated_spend for item in summaries) + repriced_spend,
         recorded_spend=sum(getattr(item, "recorded_spend", 0.0) for item in summaries),
         codex=codex,

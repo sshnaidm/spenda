@@ -967,7 +967,7 @@ def test_unchanged_history_pass_opens_no_transcript_files(tmp_path, monkeypatch)
     assert (third.unchanged_files, sorted(p.name for p in opened)) == (38, ["agent-7.jsonl", "session-7.jsonl"])
 
 
-def test_vertex_unit_without_cost_state_stays_unpriced_in_strict_mode(tmp_path):
+def test_vertex_unit_without_cost_state_is_estimated_from_list_price(tmp_path):
     home = tmp_path / "claude"
     _write_root(
         home, "vertex-root",
@@ -984,25 +984,26 @@ def test_vertex_unit_without_cost_state_stays_unpriced_in_strict_mode(tmp_path):
     backend, billing, cost, equivalent, priced, write_1h, note = _usage_row(
         settings, "claude:vertex-root:root:msg_vrtx_01"
     )
+    # Opus 4.8 list price: 1000 uncached x $5, 2000 cached x $0.5, 3000
+    # written x $6.25, 500 output x $25, plus the 1h uplift on 1000 written.
     assert (backend, billing, cost, equivalent, priced, write_1h) == (
-        "vertex", "metered", None, None, 0, 1000,
+        "vertex", "metered", Decimal("0.04100"), None, 1, 1000,
     )
-    assert note.startswith("strict accounting: vertex backend/region price")
+    assert note.startswith("estimated from built-in Anthropic list price")
+    assert "Vertex AI regional-endpoint premiums are not modeled" in note
     with database(settings.database, readonly=True) as conn:
         session = conn.execute(
             "SELECT root_backend,accounting_status,accounting_note FROM sessions WHERE id='claude:vertex-root'"
         ).fetchone()
         agent = conn.execute("SELECT backend FROM agents WHERE thread_id='claude:vertex-root'").fetchone()
     assert tuple(session) == (
-        "vertex", "partial",
-        "Claude Code transcript has no cumulative cost-state",
+        "vertex", "estimated",
+        "Claude Code transcript has no cumulative cost-state; priced from built-in Anthropic list prices",
     )
     assert agent[0] == "vertex"
-    assert summary.unknown_prices == {
-        "vertex:claude-opus-4-8:backend-price-unavailable"
-    }
+    assert summary.unknown_prices == set()
     assert summary.backends == {"vertex": 1}
-    assert summary.estimated_records == 0 and summary.estimated_spend == 0
+    assert summary.estimated_records == 1 and summary.estimated_spend == pytest.approx(0.041)
     assert summary.subscription_value == 0
 
 
@@ -1160,17 +1161,15 @@ def test_mixed_backend_unit_and_fast_mode_rows(tmp_path):
     unknown = _usage_row(settings, "claude:root:root:msg_03")
     assert unknown[:5] == ("anthropic-api", "metered", None, None, 0)
     assert unknown[6].startswith("no built-in Anthropic price for claude-future")
-    assert summary.unknown_prices == {
-        "anthropic:claude-opus-5:fast", "anthropic:claude-future",
-        "vertex:claude-opus-5:backend-price-unavailable",
-    }
+    assert summary.unknown_prices == {"anthropic:claude-opus-5:fast", "anthropic:claude-future"}
     with database(settings.database, readonly=True) as conn:
         session = conn.execute(
             "SELECT root_backend,accounting_status,accounting_note FROM sessions WHERE id='claude:root'"
         ).fetchone()
+    # The Vertex call is estimated; the fast-mode and unknown-model calls are not.
     assert tuple(session) == (
         "mixed", "partial",
-        "Claude Code transcript has no cumulative cost-state",
+        "Claude Code transcript has no cumulative cost-state; some records have no built-in Anthropic price",
     )
 
     cost_state = _line(
@@ -1558,13 +1557,13 @@ def test_reprice_touches_only_estimated_claude_rows(tmp_path):
             input_per_million="2", cached_input_per_million="1", cache_write_per_million="1",
             output_per_million="1", source="test",
         )
-        assert reprice_usage(conn, provider="anthropic") == 1
+        assert reprice_usage(conn, provider="anthropic") == 2
         covered_after = conn.execute(
             "SELECT cost_usd,equivalent_cost_usd,pricing_note FROM usage WHERE session_id='claude:root' ORDER BY id"
         ).fetchall()
     assert covered_before == covered_after
     assert _usage_row(settings, "claude:vertex-root:root:msg_vrtx_01")[:5] == (
-        "vertex", "metered", None, None, 0,
+        "vertex", "metered", Decimal("2"), None, 1,
     )
     assert _usage_row(settings, "claude:oauth-root:root:msg_01")[:5] == (
         "anthropic-oauth", "subscription", Decimal("0"), Decimal("2"), 1,
@@ -1874,3 +1873,35 @@ def test_reprice_prices_late_calls_but_not_calls_inside_a_partial_cost_state(tmp
     assert late[2] == 2 and late[6].startswith("estimated from built-in Anthropic list price")
     assert session["known_cost_usd"] == 7
     assert session["accounting_status"] == "partial"
+
+
+def test_vertex_calls_after_last_cost_state_are_estimated(tmp_path):
+    home = tmp_path / "claude"
+    _write_root(
+        home, "root",
+        _assistant(
+            session="root", message_id="msg_vrtx_01", timestamp="2026-09-01T10:00:00Z",
+            model="claude-opus-5", input_tokens=1_000_000, output_tokens=0, cache_read=0, cache_write=0,
+        ),
+        _line(
+            kind="cost-state", session="root", timestamp="2026-09-01T10:00:01Z",
+            totalCostUSD=2, modelUsage={"claude-opus-5": {"costUSD": 2}}, hasUnknownModelCost=False,
+        ),
+        # A resumed run that ended without writing another cost-state.
+        _assistant(
+            session="root", message_id="msg_vrtx_02", timestamp="2026-09-02T10:00:00Z",
+            model="claude-opus-5", input_tokens=1_000_000, output_tokens=0, cache_read=0, cache_write=0,
+        ),
+    )
+    settings = _Settings(tmp_path / "dashboard.sqlite", home, claude_billing="api")
+    ingest_claude(settings)
+
+    covered = _usage_row(settings, "claude:root:root:msg_vrtx_01")
+    assert covered[:5] == ("vertex", "metered", Decimal("0"), None, 0)
+    late = _usage_row(settings, "claude:root:root:msg_vrtx_02")
+    assert late[:5] == ("vertex", "metered", Decimal("5"), None, 1)
+    with database(settings.database, readonly=True) as conn:
+        status = conn.execute("SELECT accounting_status FROM sessions WHERE id='claude:root'").fetchone()[0]
+        detail = session_detail(conn, "claude:root")
+    assert status == "estimated"
+    assert detail["known_cost_usd"] == pytest.approx(7)

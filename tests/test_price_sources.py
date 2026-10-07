@@ -168,3 +168,36 @@ def test_ingest_summary_counts_spend_priced_after_adapters(dashboard_settings, m
     summary = ingest_all(dashboard_settings)
     assert summary.fetched_prices == ["openai:gpt-9-nova"]
     assert summary.estimated_spend == float(usage_cost(dashboard_settings)[1]) > 0
+
+
+def test_fetched_price_covers_later_calls_in_its_first_second(dashboard_settings):
+    path = dashboard_settings.codex_home / "sessions" / "2026" / "09" / "08" / "rollout-root.jsonl"
+    write_rollout(path, [
+        session_meta("root"), turn("turn", "gpt-9-nova"),
+        atomic("root", "turn", "first", timestamp="2026-09-08T10:00:02Z"),
+        atomic("root", "turn", "later", ordinal=3, timestamp="2026-09-08T10:00:02.500Z"),
+    ])
+    make_state(dashboard_settings.codex_home, [thread("root", path, model="gpt-9-nova", agent_path="/root")])
+    ingest(dashboard_settings)
+    with database(dashboard_settings.database) as conn:
+        assert fill_missing_prices(conn, fetch=lambda: CATALOGUE) == ["openai:gpt-9-nova"]
+        costs = dict(conn.execute("SELECT response_id,cost_usd FROM usage").fetchall())
+    assert costs["first"] is not None and costs["later"] is not None
+
+
+def test_unpriced_fast_calls_stay_in_unknown_prices_after_fetch(dashboard_settings, monkeypatch):
+    from test_service_tier import settings_applied
+
+    path = dashboard_settings.codex_home / "sessions" / "2026" / "09" / "08" / "rollout-root.jsonl"
+    write_rollout(path, [
+        session_meta("root"), settings_applied("priority"), turn("turn", "gpt-9-nova", 2),
+        atomic("root", "turn", "fast", ordinal=3),
+    ])
+    make_state(dashboard_settings.codex_home, [thread("root", path, model="gpt-9-nova", agent_path="/root")])
+    monkeypatch.setenv("SPENDA_PRICE_FETCH", "1")
+    # The catalogue lists gpt-9-nova without a Fast-mode price.
+    monkeypatch.setattr("spenda.price_sources.fetch_models_dev", lambda: CATALOGUE)
+    summary = ingest_all(dashboard_settings)
+    assert summary.fetched_prices == ["openai:gpt-9-nova"]
+    assert usage_cost(dashboard_settings)[1] is None
+    assert "openai:gpt-9-nova" in summary.unknown_prices

@@ -244,19 +244,34 @@ def utc_timestamp(value: str) -> str:
         return value
 
 
+def timestamp_instant(value: str) -> datetime | None:
+    """Parse an ISO timestamp for ordering; naive values are taken as UTC."""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 def find_price(conn: sqlite3.Connection, model: str, provider: str, timestamp: str) -> sqlite3.Row | None:
     alias = conn.execute(
         "SELECT canonical_model FROM model_aliases WHERE alias=? AND provider=?", (model, provider)
     ).fetchone()
     canonical = alias[0] if alias else model
-    stamp = utc_timestamp(timestamp)
-    return conn.execute(
-        """SELECT * FROM prices
-           WHERE model=? AND provider=? AND effective_from<=?
-             AND (effective_until IS NULL OR effective_until>?)
-           ORDER BY effective_from DESC LIMIT 1""",
-        (canonical, provider, stamp, stamp),
-    ).fetchone()
+    stamp = timestamp_instant(timestamp)
+    if stamp is None:
+        return None
+    # Interval bounds are compared as instants: as strings, "...10:00:02Z"
+    # sorts after "...10:00:02.500Z" and would miss a call in its first second.
+    best, best_start = None, None
+    for row in conn.execute("SELECT * FROM prices WHERE model=? AND provider=?", (canonical, provider)):
+        start = timestamp_instant(row["effective_from"])
+        until = timestamp_instant(row["effective_until"]) if row["effective_until"] else None
+        if start is None or start > stamp or (row["effective_until"] and (until is None or until <= stamp)):
+            continue
+        if best_start is None or start > best_start:
+            best, best_start = row, start
+    return best
 
 
 def calculate_cost(
@@ -335,16 +350,28 @@ def estimate_cost(
 # only unpriced Claude calls that a new Anthropic price row may price.
 CLAUDE_NO_PRICE_NOTE = "no built-in Anthropic price for "
 CLAUDE_COVERED_NOTE = "cost represented by cumulative Claude Code cost-state"
+CLAUDE_WITHHELD_NOTE = (
+    "included in a partial or unreadable Claude Code cost-state; not priced separately to avoid double counting"
+)
 CLAUDE_NO_COST_STATE_NOTE = "Claude Code transcript has no cumulative cost-state"
 CLAUDE_LATE_CALLS_NOTE = "Claude Code cost-state predates later calls"
 
 
-def claude_estimate_note(subscription: bool, cost_note: str | None) -> str:
+# Claude backends whose calls are estimated from Anthropic list prices when no
+# cost-state covers them.  Vertex AI and Bedrock list the same base prices;
+# their regional-endpoint premiums are not in the transcript.
+CLAUDE_LIST_PRICED_BACKENDS = ("anthropic-api", "anthropic-oauth", "vertex", "bedrock")
+_PARTNER_BACKENDS = {"vertex": "Vertex AI", "bedrock": "Bedrock"}
+
+
+def claude_estimate_note(subscription: bool, cost_note: str | None, backend: str | None = None) -> str:
     note = (
         "subscription usage: real cost $0; equivalent API value estimated from built-in Anthropic list price"
         if subscription
         else "estimated from built-in Anthropic list price; no complete cost-state covers this message"
     )
+    if backend in _PARTNER_BACKENDS:
+        note += f"; {_PARTNER_BACKENDS[backend]} regional-endpoint premiums are not modeled"
     return f"{note}; {cost_note}" if cost_note else note
 
 
@@ -405,9 +432,11 @@ def repriceable_clauses() -> tuple[list[str], list[object]]:
         "(source_event_type!='claude_assistant_message' OR price_id IS NOT NULL"
         " OR substr(COALESCE(pricing_note,''),1,?)=?)",
         "NOT (source_event_type GLOB 'cursor_*' AND total_tokens=0)",
-        "(source_event_type!='claude_assistant_message' OR backend IN ('anthropic-api','anthropic-oauth'))",
+        "(source_event_type!='claude_assistant_message' OR backend IN ({}))".format(
+            ",".join("?" for _ in CLAUDE_LIST_PRICED_BACKENDS)
+        ),
         "COALESCE(pricing_note,'')!=?",
-    ], [len(CLAUDE_NO_PRICE_NOTE), CLAUDE_NO_PRICE_NOTE, FAST_MODE_NOTE]
+    ], [len(CLAUDE_NO_PRICE_NOTE), CLAUDE_NO_PRICE_NOTE, *CLAUDE_LIST_PRICED_BACKENDS, FAST_MODE_NOTE]
     return clauses, params
 
 
@@ -454,7 +483,7 @@ def reprice_usage(
                     row["billing_mode"] == "subscription",
                 ),
                 (
-                    claude_estimate_note(row["billing_mode"] == "subscription", cost.note)
+                    claude_estimate_note(row["billing_mode"] == "subscription", cost.note, row["backend"])
                     if cost.price_id is not None
                     else claude_no_price_note(row["model"])
                 ) if row["source_event_type"] == "claude_assistant_message" else cost.note,

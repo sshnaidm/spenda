@@ -159,10 +159,11 @@ an earlier complete scan remain evidence during a temporary read failure.
 
 Claude cost-state totals are whole-session source evidence. If a cost-state
 covers metered calls from more than one backend, the session is classified as
-`mixed`; its total is not prorated and component backend filters exclude it. Without cost-state,
-only direct Anthropic API or subscription calls are estimated from first-party
-prices. Bedrock, Vertex, and unclassified direct calls stay unpriced because
-the transcript does not establish a safe provider/region/service-tier price.
+`mixed`; its total is not prorated and component backend filters exclude it. Calls no cost-state
+covers are estimated from Anthropic list prices on the direct API,
+subscription, Bedrock, and Vertex AI backends; partner regional-endpoint
+premiums are not in the transcript and are not modeled. Unclassified direct
+calls stay unpriced because they may be subscription usage.
 
 Claude scans import valid records from a readable transcript even when another
 line or transcript has an error. Destructive reconciliation is limited to
