@@ -21,12 +21,16 @@ Tests use synthetic temporary source data. They must not depend on a contributor
 - `src/spenda/db.py` owns the normalized schema and migrations.
 - `src/spenda/pricing.py` contains effective-dated price calculations.
 - `tests/` contains synthetic unit and integration fixtures.
+- `scripts/demo/` records the README demo animation from synthetic data.
 - `docs/` records source schemas and accounting decisions.
 
 ## Documentation
 
 - [Data sources](docs/data-sources.md) describes discovery, source fields, and normalization for each supported tool.
 - [Accounting rules](docs/accounting.md) explains cost and token calculations.
+- `docs/demo.webp` is generated: after a visible UI change, rerun
+  `uv run --with playwright --with pillow python scripts/demo/record.py` (needs Chromium or Chrome).
+  It invents its own agent history and never reads yours.
 
 ## Make a change
 

@@ -2,7 +2,7 @@
 
 A local dashboard for token usage, costs, models, projects, and session activity from Codex, OpenCode, Claude Code, and Cursor.
 
-![Dashboard overview](docs/screenshots/overview.png)
+![Spenda demo](docs/demo.webp)
 
 ## What you can see
 
