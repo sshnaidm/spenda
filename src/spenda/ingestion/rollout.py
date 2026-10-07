@@ -16,6 +16,7 @@ class ParserContext:
     model: str | None = None
     reasoning_effort: str | None = None
     provider: str | None = None
+    service_tier: str | None = None
     previous_cumulative: TokenUsage | None = None
     recent_atomic: tuple[int, ...] | None = None
     pending_call_label: str | None = None
@@ -36,6 +37,7 @@ class UsageRecord:
     ordinal: int | None
     event_type: str
     call_label: str | None
+    service_tier: str | None = None
 
 
 @dataclass(slots=True)
@@ -89,6 +91,17 @@ class RolloutParser:
             if isinstance(provider, str):
                 self.context.provider = provider
             return ParseResult(session_meta=payload, session_timestamp=timestamp)
+
+        if kind == "event_msg" and isinstance(payload, dict) and payload.get("type") == "thread_settings_applied":
+            # The tier applies until the thread's settings change again; Codex
+            # writes it here only (``service_tier`` "default", "priority", ...).
+            settings = payload.get("thread_settings")
+            thread_id = payload.get("thread_id")
+            owner = self.context.owner_thread_id
+            if isinstance(settings, dict) and (not isinstance(thread_id, str) or not owner or thread_id == owner):
+                tier = settings.get("service_tier")
+                self.context.service_tier = tier if isinstance(tier, str) else None
+            return ParseResult(ignored_type="event_msg:thread_settings_applied")
 
         if kind == "turn_context" and isinstance(payload, dict):
             self._take_call_label()
@@ -150,7 +163,7 @@ class RolloutParser:
                 identity, thread_id, turn_id, response_id, timestamp or _timestamp_fallback(),
                 self.context.model or "unknown-model", self.context.provider or "unknown-provider",
                 self.context.reasoning_effort,
-                usage, ordinal, "token_usage_record", call_label,
+                usage, ordinal, "token_usage_record", call_label, self.context.service_tier,
             ))
 
         if kind == "event_msg" and isinstance(payload, dict) and payload.get("type") == "token_count":
@@ -209,7 +222,7 @@ class RolloutParser:
                 identity, thread_id, self.context.turn_id, None, timestamp or _timestamp_fallback(),
                 self.context.model or "unknown-model", self.context.provider or "unknown-provider",
                 self.context.reasoning_effort,
-                usage, ordinal, event_type, self._take_call_label(),
+                usage, ordinal, event_type, self._take_call_label(), self.context.service_tier,
             )
             return ParseResult(usage=parsed, warning=reset_warning)
 
@@ -289,6 +302,7 @@ def context_from_row(row: Any) -> ParserContext:
         model=row["current_model"] if row else None,
         reasoning_effort=row["current_reasoning_effort"] if row else None,
         provider=row["current_provider"] if row else None,
+        service_tier=row["current_service_tier"] if row and "current_service_tier" in row.keys() else None,
         previous_cumulative=previous,
         recent_atomic=recent,
         pending_call_label=row["pending_call_label"] if row and "pending_call_label" in row.keys() else None,

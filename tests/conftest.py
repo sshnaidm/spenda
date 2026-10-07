@@ -15,6 +15,8 @@ def _isolated_cursor_history(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "missing-cursor"))
     monkeypatch.setenv("CURSOR_USER_DIR", str(tmp_path / "missing-cursor-user"))
+    # Ingestion may look up missing prices on models.dev; tests stay offline.
+    monkeypatch.setenv("SPENDA_PRICE_FETCH", "0")
 
 
 @pytest.fixture

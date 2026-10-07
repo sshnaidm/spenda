@@ -9,15 +9,49 @@ from .models import CostResult, TokenUsage
 
 MILLION = Decimal(1_000_000)
 
+# ``priority`` is the Fast-mode (formerly "priority processing") multiplier
+# over every standard rate, from the official pricing page captured
+# 2026-10-07; ``None`` means the model has no Fast tier.  Rows without the key
+# (Anthropic) leave Fast-mode calls unpriced.
+#
 # The coverage-floor dates are explicit so a future price update adds a new row
 # instead of changing old estimates. See docs/accounting.md for the historical
 # limitation of the first captured price set.
 BUILTIN_PRICES = (
     {
+        "model": "gpt-6.1-sol",
+        "effective_from": "2026-09-01T00:00:00Z",
+        "input": "2", "cached": "0.1", "write": "2.5", "output": "10",
+        "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
+        "source": "https://developers.openai.com/api/docs/models/gpt-6.1-sol",
+        "notes": "Official price captured 2026-10-07; start is a local-history coverage floor.",
+    },
+    {
+        "model": "gpt-6-sol",
+        "effective_from": "2026-09-01T00:00:00Z",
+        "input": "2", "cached": "0.2", "write": "2.5", "output": "10",
+        "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
+        "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
+        "notes": "Official price captured 2026-10-07; start is a local-history coverage floor; "
+                 "cache-write rate from models.dev.",
+    },
+    {
+        "model": "gpt-6-luna",
+        "effective_from": "2026-09-01T00:00:00Z",
+        "input": "0.1", "cached": "0.01", "write": "0.125", "output": "0.5",
+        "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
+        "source": "https://developers.openai.com/api/docs/models/gpt-6-luna",
+        "notes": "Official price captured 2026-10-07; start is a local-history coverage floor.",
+    },
+    {
         "model": "gpt-6-astra",
         "effective_from": "2026-09-08T00:00:00Z",
         "input": "10", "cached": "1", "write": "12.5", "output": "50",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-6-astra",
         "notes": "Official price captured 2026-09-08.",
     },
@@ -26,6 +60,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-07-01T00:00:00Z",
         "input": "4", "cached": "0.4", "write": "5", "output": "20",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.6-sol",
         "notes": "Official price captured 2026-09-08; start is a local-history coverage floor.",
     },
@@ -34,6 +69,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-07-01T00:00:00Z",
         "input": "2", "cached": "0.2", "write": "2.5", "output": "12",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra",
         "notes": "Official price captured 2026-09-08; start is a local-history coverage floor.",
     },
@@ -42,6 +78,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-07-01T00:00:00Z",
         "input": "0.2", "cached": "0.02", "write": "0.25", "output": "1.2",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna",
         "notes": "Official price captured 2026-09-08; start is a local-history coverage floor.",
     },
@@ -50,6 +87,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-04-23T00:00:00Z",
         "input": "5", "cached": "0.5", "write": "5", "output": "30",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2.5",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.5",
         "notes": "Official price captured 2026-09-08; cache writes use ordinary input rate.",
     },
@@ -58,6 +96,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-03-05T00:00:00Z",
         "input": "2.5", "cached": "0.25", "write": "2.5", "output": "15",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.4",
         "notes": "Official price captured 2026-09-08; cache writes use ordinary input rate.",
     },
@@ -66,6 +105,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-03-17T00:00:00Z",
         "input": "0.75", "cached": "0.075", "write": "0.75", "output": "4.5",
         "threshold": None, "long_in": "1", "long_out": "1",
+        "priority": "2",
         "source": "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
         "notes": "Official price captured 2026-09-08; cache writes use ordinary input rate.",
     },
@@ -74,6 +114,7 @@ BUILTIN_PRICES = (
         "effective_from": "2026-03-05T00:00:00Z",
         "input": "30", "cached": "30", "write": "30", "output": "180",
         "threshold": 272000, "long_in": "2", "long_out": "1.5",
+        "priority": None,
         "source": "https://developers.openai.com/api/docs/models/gpt-5.4-pro",
         "notes": "Official price captured 2026-09-08; no cached-input discount.",
     },
@@ -125,6 +166,14 @@ BUILTIN_ALIASES = (
     ("claude-haiku-4-5@20251001", "claude-haiku-4-5", "anthropic"),
 )
 
+# Codex records ``service_tier`` per thread; "priority" was renamed "fast".
+FAST_TIERS = frozenset({"priority", "fast"})
+
+
+def no_fast_price_note(model: str) -> str:
+    return f"no Fast-mode price for {model}"
+
+
 # Claude Code labels 1M-context requests with a "[1m]" suffix; the price is the
 # model's standard rate across the full window.
 _CONTEXT_SUFFIX = "[1m]"
@@ -164,14 +213,22 @@ def seed_prices(conn: sqlite3.Connection) -> None:
             """INSERT OR IGNORE INTO prices(
                 model,provider,effective_from,input_per_million,
                 cached_input_per_million,cache_write_per_million,output_per_million,
-                long_context_threshold,long_input_multiplier,long_output_multiplier,source,notes
-            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                long_context_threshold,long_input_multiplier,long_output_multiplier,priority_multiplier,
+                source,notes
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 row["model"], row.get("provider", "openai"), row["effective_from"], row["input"],
                 row["cached"], row["write"], row["output"], row["threshold"], row["long_in"],
-                row["long_out"], row["source"], row["notes"],
+                row["long_out"], row.get("priority"), row["source"], row["notes"],
             ),
         )
+        if row.get("priority") is not None:
+            # Databases seeded before Fast-mode pricing keep their built-in rows.
+            conn.execute(
+                "UPDATE prices SET priority_multiplier=? WHERE model=? AND provider=? AND effective_from=? "
+                "AND source=? AND priority_multiplier IS NULL",
+                (row["priority"], row["model"], row.get("provider", "openai"), row["effective_from"], row["source"]),
+            )
     for alias, canonical, provider in BUILTIN_ALIASES:
         conn.execute(
             "INSERT OR IGNORE INTO model_aliases(alias,canonical_model,provider) VALUES(?,?,?)",
@@ -179,7 +236,8 @@ def seed_prices(conn: sqlite3.Connection) -> None:
         )
 
 
-def _iso(value: str) -> str:
+def utc_timestamp(value: str) -> str:
+    """Normalize an ISO timestamp to the UTC ``...Z`` form price intervals compare."""
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(UTC).isoformat().replace("+00:00", "Z")
     except (TypeError, ValueError):
@@ -191,7 +249,7 @@ def find_price(conn: sqlite3.Connection, model: str, provider: str, timestamp: s
         "SELECT canonical_model FROM model_aliases WHERE alias=? AND provider=?", (model, provider)
     ).fetchone()
     canonical = alias[0] if alias else model
-    stamp = _iso(timestamp)
+    stamp = utc_timestamp(timestamp)
     return conn.execute(
         """SELECT * FROM prices
            WHERE model=? AND provider=? AND effective_from<=?
@@ -207,6 +265,7 @@ def calculate_cost(
     model: str,
     provider: str,
     timestamp: str,
+    service_tier: str | None = None,
 ) -> CostResult:
     price = find_price(conn, model, provider, timestamp)
     if price is None:
@@ -214,11 +273,19 @@ def calculate_cost(
     input_multiplier = Decimal("1")
     output_multiplier = Decimal("1")
     threshold = price["long_context_threshold"]
-    note = None
+    notes = []
     if threshold is not None and usage.input_tokens > threshold:
         input_multiplier = Decimal(price["long_input_multiplier"])
         output_multiplier = Decimal(price["long_output_multiplier"])
-        note = f"long-context multipliers applied above {threshold} input tokens"
+        notes.append(f"long-context multipliers applied above {threshold} input tokens")
+    if service_tier in FAST_TIERS:
+        if price["priority_multiplier"] is None:
+            return CostResult(None, None, None, None, None, None, no_fast_price_note(model))
+        fast = Decimal(price["priority_multiplier"])
+        input_multiplier *= fast
+        output_multiplier *= fast
+        notes.append(f"Fast-mode ({service_tier}) {price['priority_multiplier']}x rate applied")
+    note = "; ".join(notes) or None
     uncached = Decimal(usage.uncached_input_tokens) * Decimal(price["input_per_million"]) * input_multiplier / MILLION
     cached = (
         Decimal(usage.cached_input_tokens) * Decimal(price["cached_input_per_million"]) * input_multiplier / MILLION
@@ -239,6 +306,7 @@ def estimate_cost(
     timestamp: str,
     *,
     cache_write_1h_tokens: int = 0,
+    service_tier: str | None = None,
 ) -> CostResult:
     """Price a record from list prices, uplifting 1-hour cache writes to 2x input.
 
@@ -249,7 +317,7 @@ def estimate_cost(
     # Model-name canonicalization covers Anthropic spellings only; other
     # providers (e.g. Cursor) are priced by the exact name they were ingested with.
     lookup = price_model(model) if provider == "anthropic" else model
-    cost = calculate_cost(conn, usage, lookup, provider, timestamp)
+    cost = calculate_cost(conn, usage, lookup, provider, timestamp, service_tier)
     if cost.price_id is None or cache_write_1h_tokens <= 0:
         return cost
     price = conn.execute("SELECT input_per_million FROM prices WHERE id=?", (cost.price_id,)).fetchone()
@@ -307,20 +375,20 @@ def add_price(
     provider: str = "openai",
     effective_until: str | None = None,
     notes: str | None = None,
+    priority_multiplier: str | None = None,
 ) -> None:
     conn.execute(
         """INSERT INTO prices(model,provider,effective_from,effective_until,
            input_per_million,cached_input_per_million,cache_write_per_million,
-           output_per_million,source,notes) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+           output_per_million,priority_multiplier,source,notes) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
         (model, provider, effective_from, effective_until, input_per_million,
-         cached_input_per_million, cache_write_per_million, output_per_million, source, notes),
+         cached_input_per_million, cache_write_per_million, output_per_million, priority_multiplier,
+         source, notes),
     )
 
 
-def reprice_usage(
-    conn: sqlite3.Connection, *, model: str | None = None, provider: str | None = None
-) -> int:
-    """Recalculate stored audit rows after an effective-dated price change."""
+def repriceable_clauses() -> tuple[list[str], list[object]]:
+    """Return SQL clauses selecting usage rows that a price change may reprice."""
     # OpenCode and Claude Code cost-state rows carry source-owned accounting and
     # are never repriced.  Claude call rows are repriced only when they were
     # estimated from list prices (or still unpriced); rows whose dollars are
@@ -340,6 +408,14 @@ def reprice_usage(
         "(source_event_type!='claude_assistant_message' OR backend IN ('anthropic-api','anthropic-oauth'))",
         "COALESCE(pricing_note,'')!=?",
     ], [len(CLAUDE_NO_PRICE_NOTE), CLAUDE_NO_PRICE_NOTE, FAST_MODE_NOTE]
+    return clauses, params
+
+
+def reprice_usage(
+    conn: sqlite3.Connection, *, model: str | None = None, provider: str | None = None
+) -> int:
+    """Recalculate stored audit rows after an effective-dated price change."""
+    clauses, params = repriceable_clauses()
     if model is not None:
         clauses.append("model=?")
         params.append(model)
@@ -362,6 +438,7 @@ def reprice_usage(
         cost = estimate_cost(
             conn, usage, row["model"], row["provider"], row["timestamp"],
             cache_write_1h_tokens=int(row["cache_write_1h_input_tokens"] or 0),
+            service_tier=row["service_tier"],
         )
         conn.execute(
             """UPDATE usage SET price_id=?,uncached_input_usd=?,cached_input_usd=?,

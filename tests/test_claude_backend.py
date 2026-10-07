@@ -213,11 +213,11 @@ def test_schema_v5_database_gains_backend_columns(tmp_path):
         version = conn.execute("SELECT value FROM dashboard_meta WHERE key='schema_version'").fetchone()[0]
     assert {
         "backend", "billing_mode", "cache_write_1h_input_tokens", "equivalent_cost_usd",
-        "counts_toward_totals",
+        "counts_toward_totals", "service_tier",
     } <= usage
     assert {"root_backend", "cost_state_status"} <= sessions and "backend" in agents
     assert row == (None, "metered", 0, None, "0", 1)
-    assert version == "8"
+    assert version == "9"
 
 
 def test_process_environment_key_does_not_override_a_subscription_login(tmp_path):

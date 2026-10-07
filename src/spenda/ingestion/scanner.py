@@ -15,7 +15,7 @@ from .codex_state import StateSnapshot, read_state, resolve_root
 from .rollout import RolloutParser, context_from_row, context_json
 
 log = logging.getLogger(__name__)
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -406,10 +406,12 @@ def _scan_file(
             provider=parsed.provider, source_path=str(path),
             reasoning_effort=parsed.reasoning_effort,
         )
-        cost = calculate_cost(conn, parsed.usage, parsed.model, parsed.provider, parsed.timestamp)
+        cost = calculate_cost(
+            conn, parsed.usage, parsed.model, parsed.provider, parsed.timestamp, parsed.service_tier
+        )
         values = (
             parsed.identity, root, parsed.thread_id, parsed.turn_id, parsed.response_id,
-            parsed.timestamp, parsed.model, parsed.provider, parsed.usage.input_tokens,
+            parsed.timestamp, parsed.model, parsed.provider, parsed.service_tier, parsed.usage.input_tokens,
             parsed.usage.cached_input_tokens, parsed.usage.cache_write_input_tokens,
             parsed.usage.uncached_input_tokens, parsed.usage.output_tokens,
             parsed.usage.reasoning_output_tokens, parsed.usage.total_tokens, str(path),
@@ -423,11 +425,11 @@ def _scan_file(
         )
         cursor = conn.execute(
             """INSERT OR IGNORE INTO usage(source_record_identity,session_id,thread_id,turn_id,response_id,
-               timestamp,model,provider,input_tokens,cached_input_tokens,cache_write_input_tokens,
+               timestamp,model,provider,service_tier,input_tokens,cached_input_tokens,cache_write_input_tokens,
                uncached_input_tokens,output_tokens,reasoning_output_tokens,total_tokens,source_file,
                source_ordinal,source_event_type,call_label,price_id,uncached_input_usd,cached_input_usd,
                cache_write_usd,output_usd,cost_usd,pricing_note)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             values,
         )
         if cursor.rowcount:
@@ -442,6 +444,8 @@ def _scan_file(
                     "UPDATE usage SET call_label=? WHERE source_record_identity=? AND call_label IS NULL",
                     (parsed.call_label, parsed.identity),
                 )
+            if parsed.service_tier:
+                _backfill_service_tier(conn, parsed.identity, parsed.service_tier, cost)
             summary.duplicate_records += 1
     end_offset = start + complete_bytes
     previous_json = context_json(parser.context.previous_cumulative)
@@ -449,21 +453,38 @@ def _scan_file(
     conn.execute(
         """INSERT INTO ingestion_state(source_key,source_path,inode,last_offset,mtime_ns,size,parser_version,
            last_successful_ingestion,owner_thread_id,current_turn_id,current_model,current_reasoning_effort,
-           current_provider,previous_cumulative_json,recent_atomic_json,pending_call_label,pending_call_priority)
-           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET
+           current_provider,current_service_tier,previous_cumulative_json,recent_atomic_json,pending_call_label,
+           pending_call_priority)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(source_key) DO UPDATE SET
            source_path=excluded.source_path,inode=excluded.inode,last_offset=excluded.last_offset,
            mtime_ns=excluded.mtime_ns,size=excluded.size,parser_version=excluded.parser_version,
            last_successful_ingestion=excluded.last_successful_ingestion,owner_thread_id=excluded.owner_thread_id,
            current_turn_id=excluded.current_turn_id,current_model=excluded.current_model,
            current_reasoning_effort=excluded.current_reasoning_effort,current_provider=excluded.current_provider,
-           previous_cumulative_json=excluded.previous_cumulative_json,recent_atomic_json=excluded.recent_atomic_json,
+           current_service_tier=excluded.current_service_tier,previous_cumulative_json=excluded.previous_cumulative_json,recent_atomic_json=excluded.recent_atomic_json,
            pending_call_label=excluded.pending_call_label,pending_call_priority=excluded.pending_call_priority""",
         (
             source_key, str(path), before.st_ino, end_offset, before.st_mtime_ns, before.st_size,
             PARSER_VERSION, datetime.now(UTC).isoformat(), parser.context.owner_thread_id,
             parser.context.turn_id, parser.context.model, parser.context.reasoning_effort,
-            parser.context.provider, previous_json, recent_json,
+            parser.context.provider, parser.context.service_tier, previous_json, recent_json,
             parser.context.pending_call_label, parser.context.pending_call_priority,
+        ),
+    )
+
+
+def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, cost) -> None:
+    """Record the tier of a call ingested before tiers were parsed and reprice it."""
+    conn.execute(
+        """UPDATE usage SET service_tier=?,price_id=?,uncached_input_usd=?,cached_input_usd=?,
+           cache_write_usd=?,output_usd=?,cost_usd=?,pricing_note=?
+           WHERE source_record_identity=? AND service_tier IS NULL AND source_event_type NOT GLOB 'opencode_*'""",
+        (
+            tier, cost.price_id,
+            *(str(value) if value is not None else None for value in (
+                cost.uncached_input_usd, cost.cached_input_usd, cost.cache_write_usd, cost.output_usd, cost.total_usd,
+            )),
+            cost.note, identity,
         ),
     )
 

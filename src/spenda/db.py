@@ -5,7 +5,7 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS prices (
     long_context_threshold INTEGER,
     long_input_multiplier TEXT NOT NULL DEFAULT '1',
     long_output_multiplier TEXT NOT NULL DEFAULT '1',
+    priority_multiplier TEXT,
     source TEXT NOT NULL,
     notes TEXT,
     UNIQUE(model, provider, effective_from)
@@ -95,6 +96,7 @@ CREATE TABLE IF NOT EXISTS usage (
     provider TEXT NOT NULL,
     backend TEXT,
     billing_mode TEXT NOT NULL DEFAULT 'metered',
+    service_tier TEXT,
     input_tokens INTEGER NOT NULL,
     cached_input_tokens INTEGER NOT NULL,
     cache_write_input_tokens INTEGER NOT NULL,
@@ -131,6 +133,7 @@ CREATE TABLE IF NOT EXISTS ingestion_state (
     current_model TEXT,
     current_reasoning_effort TEXT,
     current_provider TEXT,
+    current_service_tier TEXT,
     previous_cumulative_json TEXT,
     recent_atomic_json TEXT,
     pending_call_label TEXT,
@@ -211,7 +214,7 @@ def _migrate_session_source_columns(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_backend_columns(conn: sqlite3.Connection) -> None:
-    """Add post-v5 API-backend, billing, and authoritative-ledger columns."""
+    """Add post-v5 API-backend, billing, service-tier, and authoritative-ledger columns."""
     additions = {
         "sessions": (("root_backend", "TEXT"), ("cost_state_status", "TEXT")),
         "agents": (("backend", "TEXT"),),
@@ -221,7 +224,10 @@ def _migrate_backend_columns(conn: sqlite3.Connection) -> None:
             ("cache_write_1h_input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("equivalent_cost_usd", "TEXT"),
             ("counts_toward_totals", "INTEGER NOT NULL DEFAULT 1"),
+            ("service_tier", "TEXT"),
         ),
+        "prices": (("priority_multiplier", "TEXT"),),
+        "ingestion_state": (("current_service_tier", "TEXT"),),
     }
     for table, columns in additions.items():
         existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

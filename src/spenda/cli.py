@@ -22,6 +22,7 @@ from .ingestion.cursor import cli_store_paths, discover_cursor_home, discover_cu
 from .ingestion.opencode import discover_opencode_database
 from .ingestion.scanner import discover_rollouts
 from .ingestion.service import ingest_all as ingest
+from .price_sources import fill_missing_prices
 from .pricing import add_price, reprice_usage, seed_prices
 from .reports import (
     as_dict,
@@ -109,6 +110,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_config(rebuild)
     rebuild.add_argument("--yes", action="store_true", help="Confirm dashboard database deletion")
 
+    update = sub.add_parser("prices-update", help="Fetch prices for unpriced models from models.dev")
+    _add_config(update)
+
     price = sub.add_parser("price-add", help="Add a historical price row")
     _add_config(price)
     price.add_argument("model")
@@ -118,6 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     price.add_argument("--cached-input", required=True)
     price.add_argument("--cache-write", required=True)
     price.add_argument("--output-price", required=True)
+    price.add_argument("--priority-multiplier", help="Fast-mode (priority) multiplier over every standard rate")
     price.add_argument("--effective-until")
     price.add_argument("--source", required=True)
     price.add_argument("--notes")
@@ -157,6 +162,8 @@ def _print_ingest(summary) -> None:
     print(f"Unknown prices: {', '.join(sorted(summary.unknown_prices)) or '0'}")
     print(f"Source-recorded spend added: ${getattr(summary, 'recorded_spend', 0):.4f}")
     print(f"Estimated spend added: ${summary.estimated_spend:.4f}")
+    if getattr(summary, "fetched_prices", None):
+        print(f"Prices fetched from models.dev: {', '.join(summary.fetched_prices)}")
     claude = getattr(summary, "claude", summary)
     if getattr(claude, "subscription_value", 0):
         print(f"Subscription equivalent value added: ${claude.subscription_value:.4f}")
@@ -592,7 +599,14 @@ def main(argv: list[str] | None = None) -> int:
                 f"{row['model']:18} {row['provider']:8} {row['effective_from']}..{until} "
                 f"in={row['input_per_million']} cached={row['cached_input_per_million']} "
                 f"write={row['cache_write_per_million']} out={row['output_per_million']} USD/MTok"
+                + (f" fast={row['priority_multiplier']}x" if row["priority_multiplier"] else "")
             )
+        return 0
+    if args.command == "prices-update":
+        _prepare(settings)
+        with database(settings.database) as conn:
+            added = fill_missing_prices(conn, force=True)
+        print(f"Prices fetched from models.dev: {', '.join(added) or 'none'}")
         return 0
     if args.command == "price-add":
         _prepare(settings)
@@ -602,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
                 effective_until=args.effective_until, input_per_million=args.input,
                 cached_input_per_million=args.cached_input, cache_write_per_million=args.cache_write,
                 output_per_million=args.output_price, source=args.source, notes=args.notes,
+                priority_multiplier=args.priority_multiplier,
             )
             updated = reprice_usage(conn, provider=args.provider)
         print(f"Repriced usage records: {updated}")
