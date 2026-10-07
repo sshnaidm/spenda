@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Accounting rules
+    url: https://github.com/sshnaidm/spenda/blob/master/docs/accounting.md
+    about: How each cost is reported, estimated, or left unpriced. Worth a look before reporting a number that seems wrong.
+  - name: Contributing guide
+    url: https://github.com/sshnaidm/spenda/blob/master/CONTRIBUTING.md
+    about: Development setup, source-adapter rules, and validation steps.

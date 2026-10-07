@@ -1,0 +1,82 @@
+name: Bug report
+description: Something is wrong, such as a crash, a missing session, or a cost or token total that looks off.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Please do not paste private data**: no prompts or responses, transcripts, dashboard databases, credentials, or project names you would not publish. Round or replace amounts if they are sensitive; the shape of the problem is usually enough.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+      placeholder: The Sessions page shows $0.0000 for Codex calls on gpt-6-sol, but the model is priced on the Models page.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Commands you ran or pages you opened, in order.
+      placeholder: |
+        1. spenda ingest --all
+        2. spenda serve
+        3. Open Sessions, filter Agent: Codex
+    validations:
+      required: true
+  - type: dropdown
+    id: sources
+    attributes:
+      label: Affected agent sources
+      multiple: true
+      options:
+        - Codex
+        - Claude Code
+        - OpenCode
+        - Cursor
+        - Not source-specific
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Claude Code API backend (if relevant)
+      options:
+        - Not relevant
+        - Claude subscription
+        - Anthropic API key
+        - Vertex AI
+        - Bedrock
+        - Not sure
+  - type: input
+    id: version
+    attributes:
+      label: Spenda version
+      description: Output of `spenda --version`, or the commit you run from.
+      placeholder: spenda 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: agent-versions
+    attributes:
+      label: Agent versions
+      description: For example `codex --version`, `claude --version`.
+      placeholder: codex-cli 0.x, Claude Code 2.x
+  - type: input
+    id: platform
+    attributes:
+      label: OS and Python
+      placeholder: Ubuntu 24.04, Python 3.12
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `spenda doctor`
+      description: Shows which sources and backends Spenda detected. Replace your username and paths before pasting.
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or logs
+      description: Tracebacks or warnings from `spenda ingest` / `spenda serve`, with paths redacted.
+      render: text
