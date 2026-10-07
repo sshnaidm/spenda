@@ -1,0 +1,49 @@
+name: Feature request
+description: Suggest a new report, a new agent source, pricing support, or another improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to find out or do, and what makes it hard today?
+      placeholder: I use two machines and want one dashboard for both.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How you imagine it working. Screens, commands, or examples help.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Dashboard / reports
+        - New agent source
+        - Existing source (Codex, Claude Code, OpenCode, Cursor)
+        - Pricing and cost accuracy
+        - CLI
+        - Packaging / installation
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: source-format
+    attributes:
+      label: Source format details (for a new or changed agent source)
+      description: Where the agent stores its history and which fields hold model, tokens, and cost. Describe the format with invented sample values; do not paste real history.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contribution
+      options:
+        - label: I would like to work on this myself.
