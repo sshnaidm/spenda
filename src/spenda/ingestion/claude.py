@@ -714,9 +714,19 @@ def _usage_values(
     )
 
 
-def _upsert_usage(conn, values: tuple[Any, ...]) -> bool:
+def _upsert_usage(conn, values: tuple[Any, ...]) -> tuple[bool, float]:
+    """Insert or update a usage row.
+
+    Returns ``(is_duplicate, cost_delta)`` where *is_duplicate* is True when
+    the row already existed and *cost_delta* is the change in cost_usd caused
+    by this call (new_cost - old_cost, clamped to ≥ 0).  A non-zero
+    *cost_delta* on a duplicate indicates the row was repriced on this pass and
+    the caller should credit the gain to the ingest summary.
+    """
     identity = values[0]
-    exists = conn.execute("SELECT 1 FROM usage WHERE source_record_identity=?", (identity,)).fetchone()
+    old_row = conn.execute(
+        "SELECT cost_usd FROM usage WHERE source_record_identity=?", (identity,)
+    ).fetchone()
     conn.execute(
         """INSERT INTO usage(source_record_identity,session_id,thread_id,turn_id,response_id,
            timestamp,model,provider,backend,billing_mode,input_tokens,cached_input_tokens,
@@ -744,7 +754,13 @@ def _upsert_usage(conn, values: tuple[Any, ...]) -> bool:
              equivalent_cost_usd=excluded.equivalent_cost_usd,pricing_note=excluded.pricing_note""",
         values,
     )
-    return exists is not None
+    if old_row is None:
+        return False, 0.0
+    # Row existed: compute cost gain (new cost_usd is at values index 28)
+    new_cost_usd = values[28]
+    old_cost = float(old_row[0]) if old_row[0] is not None else 0.0
+    new_cost = float(new_cost_usd) if new_cost_usd is not None else 0.0
+    return True, max(0.0, new_cost - old_cost)
 
 
 def _normalized_costs(state: _CostState) -> dict[str, Decimal]:
@@ -1259,8 +1275,15 @@ def ingest_claude(
                 covered_by_token_state=root_token_coverage.get(record.session_id, False) and not late,
                 cost=cost, withheld=not covered and not estimable,
             )
-            if _upsert_usage(conn, values):
+            is_duplicate, cost_delta = _upsert_usage(conn, values)
+            if is_duplicate:
                 summary.duplicate_records += 1
+                if cost_delta > 0.0:
+                    summary.estimated_records += 1
+                    if _billing_mode(record.backend) == "subscription":
+                        summary.subscription_value += cost_delta
+                    else:
+                        summary.estimated_spend += cost_delta
             else:
                 summary.usage_records += 1
                 if cost is not None and cost.total_usd is not None:
