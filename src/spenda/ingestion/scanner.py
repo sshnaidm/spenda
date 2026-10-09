@@ -445,7 +445,7 @@ def _scan_file(
                     (parsed.call_label, parsed.identity),
                 )
             if parsed.service_tier:
-                _backfill_service_tier(conn, parsed.identity, parsed.service_tier, cost)
+                summary.estimated_spend += _backfill_service_tier(conn, parsed.identity, parsed.service_tier, cost)
             summary.duplicate_records += 1
     end_offset = start + complete_bytes
     previous_json = context_json(parser.context.previous_cumulative)
@@ -473,9 +473,16 @@ def _scan_file(
     )
 
 
-def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, cost) -> None:
-    """Record the tier of a call ingested before tiers were parsed and reprice it."""
-    conn.execute(
+def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, cost) -> float:
+    """Record the tier of a call ingested before tiers were parsed and reprice it.
+
+    Returns the change in cost_usd (new_cost - old_cost) if the row was updated.
+    """
+    old_row = conn.execute(
+        "SELECT cost_usd FROM usage WHERE source_record_identity=? AND service_tier IS NULL AND source_event_type NOT GLOB 'opencode_*'",
+        (identity,)
+    ).fetchone()
+    cursor = conn.execute(
         """UPDATE usage SET service_tier=?,price_id=?,uncached_input_usd=?,cached_input_usd=?,
            cache_write_usd=?,output_usd=?,cost_usd=?,pricing_note=?
            WHERE source_record_identity=? AND service_tier IS NULL AND source_event_type NOT GLOB 'opencode_*'""",
@@ -487,6 +494,11 @@ def _backfill_service_tier(conn: sqlite3.Connection, identity: str, tier: str, c
             cost.note, identity,
         ),
     )
+    if cursor.rowcount > 0 and old_row:
+        old_cost = float(old_row[0]) if old_row[0] is not None else 0.0
+        new_cost = float(cost.total_usd) if cost.total_usd is not None else 0.0
+        return max(0.0, new_cost - old_cost)
+    return 0.0
 
 
 def _refresh_sessions(conn: sqlite3.Connection, settings: Settings) -> None:
