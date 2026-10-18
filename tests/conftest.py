@@ -7,12 +7,23 @@ from pathlib import Path
 import pytest
 
 from spenda.config import Settings
+from spenda.ingestion import claude_auth
+
+# Variables a developer's shell or an agent session commonly sets.  Claude
+# billing detection reads the backend hints from the process environment, so a
+# real ANTHROPIC_API_KEY would otherwise relabel the calls tests expect.
+_DEVELOPER_ENVIRONMENT = (
+    *claude_auth._API_KEY_VARIABLES, *claude_auth._VERTEX_VARIABLES, *claude_auth._BEDROCK_VARIABLES,
+    "CLAUDE_CONFIG_DIR", "CODEX_HOME", "OPENCODE_DB", "SPENDA_DB", "SPENDA_CLAUDE_BILLING",
+)
 
 
 @pytest.fixture(autouse=True)
-def _isolated_cursor_history(tmp_path: Path, monkeypatch) -> None:
-    """Keep every test away from the developer's real Cursor history."""
+def _isolated_environment(tmp_path: Path, monkeypatch) -> None:
+    """Keep every test away from the developer's real history and credentials."""
 
+    for name in _DEVELOPER_ENVIRONMENT:
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("CURSOR_HOME", str(tmp_path / "missing-cursor"))
     monkeypatch.setenv("CURSOR_USER_DIR", str(tmp_path / "missing-cursor-user"))
     # Ingestion may look up missing prices on models.dev; tests stay offline.
