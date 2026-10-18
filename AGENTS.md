@@ -57,9 +57,9 @@ Spenda handles people's private usage data. These rules are strict:
 
 ## Testing and experimenting safely
 
-- Tests must use synthetic data and no network. `tests/conftest.py` already points Cursor paths at empty temporary directories and sets `SPENDA_PRICE_FETCH=0`; keep new tests inside those fixtures.
+- Tests must use synthetic data and no network. `tests/conftest.py` already clears inherited credentials and source paths (`ANTHROPIC_API_KEY`, Vertex and Bedrock variables, `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `SPENDA_DB`, ...), points Cursor paths at empty temporary directories, and sets `SPENDA_PRICE_FETCH=0`; keep new tests inside those fixtures, and add any new environment variable Spenda reads to that list.
 - **Do not experiment against a user's real dashboard database.** Copy it first (`sqlite3 <db> ".backup /tmp/copy.sqlite"`) and pass `--database` / `SPENDA_DB` pointing at the copy.
-- **Watch inherited environment variables.** An agent session may run with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or similar set for its own use. Spenda honors them, and an ingest that points at the wrong Claude home treats the other home's sessions as deleted and removes their rows. Pass source paths explicitly (`--codex-home`, `--claude-home`, `--cursor-home`, `--opencode-db`) or unset those variables when running Spenda for real.
+- **Watch inherited environment variables.** An agent session may run with `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or similar set for its own use. Spenda honors them, so an ingest silently reads the wrong history (another Claude home, an empty test home) and mixes it into the dashboard database. Pass source paths explicitly (`--codex-home`, `--claude-home`, `--cursor-home`, `--opencode-db`) or unset those variables when running Spenda for real.
 - For web changes, render the affected pages for each source filter in light and dark themes. `scripts/demo/make_data.py` generates a realistic synthetic history you can ingest into a temporary database for this.
 - After a visible UI change, regenerate the README demo: `uv run --with playwright --with pillow python scripts/demo/record.py`.
 
