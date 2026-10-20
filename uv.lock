@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -587,7 +587,7 @@ wheels = [
 
 [[package]]
 name = "spenda"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
