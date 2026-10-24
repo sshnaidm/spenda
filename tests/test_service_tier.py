@@ -73,9 +73,13 @@ def test_parser_upgrade_backfills_tier_on_stored_calls(dashboard_settings, monke
         reprice_usage(conn)
         standard = Decimal(conn.execute("SELECT cost_usd FROM usage").fetchone()[0])
     assert scanner.PARSER_VERSION == 3
-    ingest(dashboard_settings)
+    second = ingest(dashboard_settings)
     ((_, tier, cost, _),) = rows(dashboard_settings)
     assert tier == "priority" and Decimal(cost) == 2 * standard
+    # The row already existed; the summary still reports the reprice.
+    assert second.duplicate_records == 1
+    assert second.estimated_spend == float(Decimal(cost) - standard)
+    assert ingest(dashboard_settings).estimated_spend == 0
 
 
 def test_call_without_fast_price_is_not_repriced_every_pass(dashboard_settings, monkeypatch):
